@@ -1,0 +1,48 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: ai-assistant
+
+  # File upload limits
+  servlet:
+    multipart:
+      max-file-size: 10MB
+      max-request-size: 10MB
+
+  # Disable auto-config for datasource/JPA (using CSV for memory)
+  autoconfigure:
+    exclude:
+      - org.springframework.boot.autoconfigure.jdbc.DataSourceAutoConfiguration
+      - org.springframework.boot.autoconfigure.orm.jpa.HibernateJpaAutoConfiguration
+
+# OpenRouter (OpenAI-compatible) — used by LangChain4j
+openrouter:
+  api-key: ${OPENROUTER_API_KEY}
+  base-url: https://openrouter.ai/api/v1
+  model: ${OPENROUTER_AI_MODEL:google/gemma-4-26b-a4b-it:free}
+
+# Pinecone Vector Store
+pinecone:
+  api-key: ${PINECONE_API_KEY}
+  index-name: ${PINECONE_INDEX_NAME:knowledge-base}
+
+# CSV-based conversation memory
+app:
+  memory:
+    csv-path: data/chat_messages.csv
+
+# Swagger / OpenAPI
+springdoc:
+  swagger-ui:
+    path: /swagger-ui.html
+    try-it-out-enabled: true
+    operations-sorter: alpha
+  api-docs:
+    path: /v3/api-docs
+
+logging:
+  level:
+    com.enterprise.aiassistant: DEBUG
+    org.springframework.ai: INFO
