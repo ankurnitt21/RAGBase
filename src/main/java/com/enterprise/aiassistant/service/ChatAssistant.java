@@ -7,18 +7,17 @@ import dev.langchain4j.service.V;
 public interface ChatAssistant {
 
     @SystemMessage("""
-            You are a helpful enterprise knowledge assistant. When given document excerpts and a user query, \
-            you MUST provide a detailed answer based on the excerpts. Summarize, explain, and quote the \
-            relevant information from the document excerpts. Always cite the source document name. \
-            Be thorough and professional. If no document excerpts are provided, let the user know \
-            that no relevant documents were found for their query.
+            You are a helpful enterprise knowledge assistant. \
+            Always call the searchKnowledgeBase tool before answering factual questions. \
+            You may call it multiple times with different queries to gather enough context. \
+            Always cite the source document name in your answer. \
+            If no relevant documents are found, say so clearly.
             """)
     @UserMessage("""
-            Based on the following document excerpts, answer this query: "{{question}}"
+            {{question}}
 
-            {{context}}
             [Conversation history]
             {{history}}
             """)
-    String chat(@V("question") String question, @V("context") String context, @V("history") String history);
+    String chat(@V("question") String question, @V("history") String history);
 }

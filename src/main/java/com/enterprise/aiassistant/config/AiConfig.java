@@ -13,6 +13,7 @@ import org.springframework.scheduling.annotation.EnableAsync;
 import com.enterprise.aiassistant.dto.Domain;
 
 import com.enterprise.aiassistant.service.ChatAssistant;
+import com.enterprise.aiassistant.service.KnowledgeBaseTools;
 import dev.langchain4j.data.segment.TextSegment;
 import dev.langchain4j.model.chat.ChatLanguageModel;
 import dev.langchain4j.model.embedding.EmbeddingModel;
@@ -46,8 +47,11 @@ public class AiConfig {
     }
 
     @Bean
-    ChatAssistant chatAssistant(ChatLanguageModel chatLanguageModel) {
-        return AiServices.create(ChatAssistant.class, chatLanguageModel);
+    ChatAssistant chatAssistant(ChatLanguageModel chatLanguageModel, KnowledgeBaseTools knowledgeBaseTools) {
+        return AiServices.builder(ChatAssistant.class)
+                .chatLanguageModel(chatLanguageModel)
+                .tools(knowledgeBaseTools)
+                .build();
     }
 
     @Bean

@@ -5,19 +5,11 @@ import com.enterprise.aiassistant.dto.ChatResponse;
 import com.enterprise.aiassistant.dto.Domain;
 import com.enterprise.aiassistant.entity.ChatMessage;
 import com.enterprise.aiassistant.exception.ChatProcessingException;
-import dev.langchain4j.data.embedding.Embedding;
-import dev.langchain4j.data.segment.TextSegment;
-import dev.langchain4j.model.embedding.EmbeddingModel;
-import dev.langchain4j.store.embedding.EmbeddingMatch;
-import dev.langchain4j.store.embedding.EmbeddingSearchRequest;
-import dev.langchain4j.store.embedding.EmbeddingSearchResult;
-import dev.langchain4j.store.embedding.EmbeddingStore;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 
 import java.util.List;
-import java.util.Map;
 import java.util.UUID;
 import java.util.stream.Collectors;
 
@@ -27,19 +19,13 @@ public class ChatService {
     private static final Logger log = LoggerFactory.getLogger(ChatService.class);
 
     private final ChatAssistant chatAssistant;
-    private final EmbeddingModel embeddingModel;
-    private final Map<Domain, EmbeddingStore<TextSegment>> domainStores;
     private final MemoryService memoryService;
     private final DomainRouterService domainRouter;
 
     public ChatService(ChatAssistant chatAssistant,
-                       EmbeddingModel embeddingModel,
-                       Map<Domain, EmbeddingStore<TextSegment>> domainStores,
                        MemoryService memoryService,
                        DomainRouterService domainRouter) {
         this.chatAssistant = chatAssistant;
-        this.embeddingModel = embeddingModel;
-        this.domainStores = domainStores;
         this.memoryService = memoryService;
         this.domainRouter = domainRouter;
     }
@@ -52,29 +38,13 @@ public class ChatService {
         Domain domain = domainRouter.route(request.question());
         log.info("Question routed to domain: {}", domain);
 
-        EmbeddingStore<TextSegment> store = domainStores.get(domain);
-
         List<ChatMessage> history = memoryService.getRecentMessages(conversationId);
-
-        Embedding questionEmbedding = embeddingModel.embed(request.question()).content();
-        EmbeddingSearchRequest searchRequest = EmbeddingSearchRequest.builder()
-                .queryEmbedding(questionEmbedding)
-                .maxResults(5)
-                .build();
-        EmbeddingSearchResult<TextSegment> searchResult = store.search(searchRequest);
-        List<EmbeddingMatch<TextSegment>> matches = searchResult.matches().stream()
-                .filter(m -> m.score() >= 0.7)
-                .collect(Collectors.toList());
-
-        log.info("Pinecone search in domain [{}]: {} matching chunks (score >= 0.7)", domain, matches.size());
-
-        String context = buildContext(matches);
         String conversationHistory = buildHistory(history);
 
         String answer;
         try {
-            answer = chatAssistant.chat(request.question(), context, conversationHistory);
-            log.info("LLM answered successfully for domain [{}]", domain);
+            answer = chatAssistant.chat(request.question(), conversationHistory);
+            log.info("LLM answered for domain [{}]", domain);
         } catch (Exception e) {
             log.error("LLM call failed: {}", e.getMessage(), e);
             throw new ChatProcessingException("The AI service is temporarily unavailable. Please try again shortly.", e);
@@ -83,33 +53,7 @@ public class ChatService {
         memoryService.saveMessage(conversationId, "user", request.question());
         memoryService.saveMessage(conversationId, "assistant", answer);
 
-        List<String> sources = matches.stream()
-                .filter(match -> match.embedded() != null)
-                .map(match -> {
-                    Object source = match.embedded().metadata().toMap().get("source");
-                    return source != null ? source.toString() : "unknown";
-                })
-                .distinct()
-                .collect(Collectors.toList());
-
-        String confidence = matches.isEmpty() ? "LOW"
-                : matches.size() >= 3 ? "HIGH" : "MEDIUM";
-
-        return new ChatResponse(answer, confidence, sources, domain.name());
-    }
-
-    private String buildContext(List<EmbeddingMatch<TextSegment>> matches) {
-        if (matches.isEmpty()) {
-            return "[No relevant document excerpts found for this query.]\n\n";
-        }
-        StringBuilder sb = new StringBuilder("Relevant document excerpts:\n\n");
-        for (int i = 0; i < matches.size(); i++) {
-            EmbeddingMatch<TextSegment> match = matches.get(i);
-            Object source = match.embedded().metadata().toMap().get("source");
-            sb.append("[Excerpt %d] (source: %s)\n%s\n\n"
-                    .formatted(i + 1, source != null ? source : "unknown", match.embedded().text()));
-        }
-        return sb.toString();
+        return new ChatResponse(answer, "TOOL_BASED", List.of(), domain.name());
     }
 
     private String buildHistory(List<ChatMessage> history) {
