@@ -28,6 +28,9 @@ Thumbs.db
 ### Env ###
 .env
 
+### Data ###
+data/
+
 ### Claude ###
 .claude/
 CLAUDE.md

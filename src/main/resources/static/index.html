@@ -520,7 +520,7 @@
     </div>
 
     <script>
-      const API = ''; // same origin
+      const API = '/api/v1';
       let conversations = JSON.parse(localStorage.getItem('ka_conversations') || '{}');
       let activeConvId = null;
       let selectedDomain = 'HR';
@@ -584,42 +584,41 @@
         const container = document.getElementById('messages');
         const empty = document.getElementById('emptyState');
 
-        if (!activeConvId || !conversations[activeConvId]) {
-          container.innerHTML = '';
-          container.appendChild(empty);
+        if (!activeConvId || !conversations[activeConvId] || conversations[activeConvId].messages.length === 0) {
           empty.style.display = 'flex';
-          return;
-        }
-
-        const msgs = conversations[activeConvId].messages;
-        if (msgs.length === 0) {
-          container.innerHTML = '';
-          container.appendChild(empty);
-          empty.style.display = 'flex';
+          // Remove only message nodes, keep emptyState in DOM
+          Array.from(container.children).forEach(c => { if (c !== empty) c.remove(); });
           return;
         }
 
         empty.style.display = 'none';
-        container.innerHTML = msgs
-          .map((m) => {
-            if (m.role === 'user') {
-              return `<div class="message user">${escapeHtml(m.content)}</div>`;
-            } else {
-              let extra = '';
-              if (m.routedDomain) {
-                extra += `<span class="domain-badge ${m.routedDomain}">${m.routedDomain}</span> `;
-              }
-              if (m.confidence) {
-                extra += `<span class="confidence ${m.confidence}">${m.confidence}</span> `;
-              }
-              if (m.sources && m.sources.length > 0) {
-                extra += `<div class="sources">Sources: ${m.sources.map(escapeHtml).join(', ')}</div>`;
-              }
-              return `<div class="message assistant">${escapeHtml(m.content)}${extra ? '<div class="meta">' + extra + '</div>' : ''}</div>`;
-            }
-          })
-          .join('');
+        // Remove old message nodes, keep emptyState in DOM
+        Array.from(container.children).forEach(c => { if (c !== empty) c.remove(); });
 
+        const msgs = conversations[activeConvId].messages;
+        const fragment = document.createDocumentFragment();
+        msgs.forEach((m) => {
+          const div = document.createElement('div');
+          if (m.role === 'user') {
+            div.className = 'message user';
+            div.textContent = m.content;
+          } else {
+            div.className = 'message assistant';
+            div.textContent = m.content;
+            let meta = '';
+            if (m.routedDomain) meta += `<span class="domain-badge ${m.routedDomain}">${m.routedDomain}</span> `;
+            if (m.confidence)   meta += `<span class="confidence ${m.confidence}">${m.confidence}</span> `;
+            if (m.sources && m.sources.length > 0) meta += `<div class="sources">Sources: ${m.sources.map(escapeHtml).join(', ')}</div>`;
+            if (meta) {
+              const metaDiv = document.createElement('div');
+              metaDiv.className = 'meta';
+              metaDiv.innerHTML = meta;
+              div.appendChild(metaDiv);
+            }
+          }
+          fragment.appendChild(div);
+        });
+        container.appendChild(fragment);
         container.scrollTop = container.scrollHeight;
       }
 
@@ -651,7 +650,7 @@
         document.getElementById('sendBtn').disabled = true;
 
         try {
-          const res = await fetch(API + '/api/chat', {
+          const res = await fetch(API + '/chat', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ conversationId: activeConvId, question })
@@ -730,7 +729,7 @@
           formData.append('domain', selectedDomain);
 
           try {
-            const res = await fetch(API + '/api/documents', { method: 'POST', body: formData });
+            const res = await fetch(API + '/documents', { method: 'POST', body: formData });
             if (!res.ok) throw new Error('Upload failed: ' + res.status);
             const data = await res.json();
             document.getElementById(itemId).className = 'upload-item success';
@@ -751,7 +750,7 @@
           formData.append('domain', selectedDomain);
 
           try {
-            const res = await fetch(API + '/api/documents/bulk', { method: 'POST', body: formData });
+            const res = await fetch(API + '/documents/bulk', { method: 'POST', body: formData });
             if (!res.ok) throw new Error('Bulk upload failed: ' + res.status);
             const data = await res.json();
             // Update all pending items
