@@ -57,6 +57,13 @@
             <version>${langchain4j.version}</version>
         </dependency>
 
+        <!-- Auto-load .env file (works in VS Code, IntelliJ, CLI — no manual export needed) -->
+        <dependency>
+            <groupId>me.paulschwarz</groupId>
+            <artifactId>spring-dotenv</artifactId>
+            <version>4.0.0</version>
+        </dependency>
+
         <!-- Swagger / OpenAPI UI -->
         <dependency>
             <groupId>org.springdoc</groupId>
