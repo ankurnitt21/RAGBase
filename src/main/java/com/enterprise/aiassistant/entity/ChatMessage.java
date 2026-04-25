@@ -1,12 +1,34 @@
 package com.enterprise.aiassistant.entity;
 
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.GeneratedValue;
+import jakarta.persistence.GenerationType;
+import jakarta.persistence.Id;
+import jakarta.persistence.Index;
+import jakarta.persistence.Table;
 import java.time.LocalDateTime;
 
+@Entity
+@Table(name = "chat_messages", indexes = {
+        @Index(name = "idx_chat_messages_conversation_id", columnList = "conversation_id")
+})
 public class ChatMessage {
 
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    @Column(name = "conversation_id", nullable = false, length = 100)
     private String conversationId;
+
+    @Column(nullable = false, length = 20)
     private String role;
+
+    @Column(nullable = false, columnDefinition = "TEXT")
     private String content;
+
+    @Column(name = "created_at", nullable = false)
     private LocalDateTime createdAt;
 
     public ChatMessage() {
@@ -19,26 +41,9 @@ public class ChatMessage {
         this.createdAt = LocalDateTime.now();
     }
 
-    public ChatMessage(String conversationId, String role, String content, LocalDateTime createdAt) {
-        this.conversationId = conversationId;
-        this.role = role;
-        this.content = content;
-        this.createdAt = createdAt;
-    }
-
-    public String getConversationId() {
-        return conversationId;
-    }
-
-    public String getRole() {
-        return role;
-    }
-
-    public String getContent() {
-        return content;
-    }
-
-    public LocalDateTime getCreatedAt() {
-        return createdAt;
-    }
+    public Long getId() { return id; }
+    public String getConversationId() { return conversationId; }
+    public String getRole() { return role; }
+    public String getContent() { return content; }
+    public LocalDateTime getCreatedAt() { return createdAt; }
 }

@@ -27,3 +27,12 @@ Thumbs.db
 
 ### Env ###
 .env
+
+### Claude ###
+.claude/
+CLAUDE.md
+
+### Internal docs ###
+LANGCHAIN_COMPONENTS.md
+PRODUCTION_ROADMAP.md
+WAREHOUSE_PROJECT.md

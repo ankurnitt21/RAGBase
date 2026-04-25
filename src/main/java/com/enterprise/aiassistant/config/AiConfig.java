@@ -15,8 +15,8 @@ import com.enterprise.aiassistant.dto.Domain;
 import dev.langchain4j.data.segment.TextSegment;
 import dev.langchain4j.model.chat.ChatLanguageModel;
 import dev.langchain4j.model.embedding.EmbeddingModel;
-import dev.langchain4j.model.embedding.onnx.allminilml6v2.AllMiniLmL6V2EmbeddingModel;
 import dev.langchain4j.model.openai.OpenAiChatModel;
+import dev.langchain4j.model.openai.OpenAiEmbeddingModel;
 import dev.langchain4j.store.embedding.EmbeddingStore;
 import dev.langchain4j.store.embedding.inmemory.InMemoryEmbeddingStore;
 import dev.langchain4j.store.embedding.pinecone.PineconeEmbeddingStore;
@@ -34,22 +34,21 @@ public class AiConfig {
     private String pineconeIndexName;
 
     @Bean
-    ChatLanguageModel chatLanguageModel(
-            @Value("${openrouter.api-key}") String apiKey,
-            @Value("${openrouter.base-url}") String baseUrl,
-            @Value("${openrouter.model}") String model) {
+    ChatLanguageModel chatLanguageModel(@Value("${openai.api-key}") String apiKey) {
         return OpenAiChatModel.builder()
                 .apiKey(apiKey)
-                .baseUrl(baseUrl)
-                .modelName(model)
+                .modelName("gpt-4o-mini")
                 .temperature(0.3)
                 .maxTokens(1024)
                 .build();
     }
 
     @Bean
-    EmbeddingModel embeddingModel() {
-        return new AllMiniLmL6V2EmbeddingModel();
+    EmbeddingModel embeddingModel(@Value("${openai.api-key}") String openAiApiKey) {
+        return OpenAiEmbeddingModel.builder()
+                .apiKey(openAiApiKey)
+                .modelName("text-embedding-3-small")
+                .build();
     }
 
     /**
