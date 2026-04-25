@@ -6,10 +6,7 @@ import com.enterprise.aiassistant.dto.Domain;
 import com.enterprise.aiassistant.entity.ChatMessage;
 import com.enterprise.aiassistant.exception.ChatProcessingException;
 import dev.langchain4j.data.embedding.Embedding;
-import dev.langchain4j.data.message.SystemMessage;
-import dev.langchain4j.data.message.UserMessage;
 import dev.langchain4j.data.segment.TextSegment;
-import dev.langchain4j.model.chat.ChatLanguageModel;
 import dev.langchain4j.model.embedding.EmbeddingModel;
 import dev.langchain4j.store.embedding.EmbeddingMatch;
 import dev.langchain4j.store.embedding.EmbeddingSearchRequest;
@@ -19,7 +16,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 
-import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -30,26 +26,18 @@ public class ChatService {
 
     private static final Logger log = LoggerFactory.getLogger(ChatService.class);
 
-    private final ChatLanguageModel chatModel;
+    private final ChatAssistant chatAssistant;
     private final EmbeddingModel embeddingModel;
     private final Map<Domain, EmbeddingStore<TextSegment>> domainStores;
     private final MemoryService memoryService;
     private final DomainRouterService domainRouter;
 
-    private static final String SYSTEM_PROMPT = """
-            You are a helpful enterprise knowledge assistant. When given document excerpts and a user query, \
-            you MUST provide a detailed answer based on the excerpts. Summarize, explain, and quote the \
-            relevant information from the document excerpts. Always cite the source document name. \
-            Be thorough and professional. If no document excerpts are provided, let the user know \
-            that no relevant documents were found for their query.
-            """;
-
-    public ChatService(ChatLanguageModel chatModel,
+    public ChatService(ChatAssistant chatAssistant,
                        EmbeddingModel embeddingModel,
                        Map<Domain, EmbeddingStore<TextSegment>> domainStores,
                        MemoryService memoryService,
                        DomainRouterService domainRouter) {
-        this.chatModel = chatModel;
+        this.chatAssistant = chatAssistant;
         this.embeddingModel = embeddingModel;
         this.domainStores = domainStores;
         this.memoryService = memoryService;
@@ -82,20 +70,10 @@ public class ChatService {
 
         String context = buildContext(matches);
         String conversationHistory = buildHistory(history);
-        String userContent = """
-                Based on the following document excerpts, answer this query: "%s"
-
-                %s
-                [Conversation history]
-                %s
-                """.formatted(request.question(), context, conversationHistory);
 
         String answer;
         try {
-            var messages = new ArrayList<dev.langchain4j.data.message.ChatMessage>();
-            messages.add(SystemMessage.from(SYSTEM_PROMPT));
-            messages.add(UserMessage.from(userContent));
-            answer = chatModel.generate(messages).content().text();
+            answer = chatAssistant.chat(request.question(), context, conversationHistory);
             log.info("LLM answered successfully for domain [{}]", domain);
         } catch (Exception e) {
             log.error("LLM call failed: {}", e.getMessage(), e);

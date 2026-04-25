@@ -12,11 +12,13 @@ import org.springframework.scheduling.annotation.EnableAsync;
 
 import com.enterprise.aiassistant.dto.Domain;
 
+import com.enterprise.aiassistant.service.ChatAssistant;
 import dev.langchain4j.data.segment.TextSegment;
 import dev.langchain4j.model.chat.ChatLanguageModel;
 import dev.langchain4j.model.embedding.EmbeddingModel;
 import dev.langchain4j.model.openai.OpenAiChatModel;
 import dev.langchain4j.model.openai.OpenAiEmbeddingModel;
+import dev.langchain4j.service.AiServices;
 import dev.langchain4j.store.embedding.EmbeddingStore;
 import dev.langchain4j.store.embedding.inmemory.InMemoryEmbeddingStore;
 import dev.langchain4j.store.embedding.pinecone.PineconeEmbeddingStore;
@@ -41,6 +43,11 @@ public class AiConfig {
                 .temperature(0.3)
                 .maxTokens(1024)
                 .build();
+    }
+
+    @Bean
+    ChatAssistant chatAssistant(ChatLanguageModel chatLanguageModel) {
+        return AiServices.create(ChatAssistant.class, chatLanguageModel);
     }
 
     @Bean
