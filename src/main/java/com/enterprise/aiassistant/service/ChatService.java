@@ -4,6 +4,7 @@ import com.enterprise.aiassistant.dto.ChatRequest;
 import com.enterprise.aiassistant.dto.ChatResponse;
 import com.enterprise.aiassistant.dto.Domain;
 import com.enterprise.aiassistant.entity.ChatMessage;
+import com.enterprise.aiassistant.exception.ChatProcessingException;
 import dev.langchain4j.data.embedding.Embedding;
 import dev.langchain4j.data.message.SystemMessage;
 import dev.langchain4j.data.message.UserMessage;
@@ -28,6 +29,7 @@ import java.util.stream.Collectors;
 public class ChatService {
 
     private static final Logger log = LoggerFactory.getLogger(ChatService.class);
+
     private final ChatLanguageModel chatModel;
     private final EmbeddingModel embeddingModel;
     private final Map<Domain, EmbeddingStore<TextSegment>> domainStores;
@@ -59,16 +61,13 @@ public class ChatService {
                 ? request.conversationId()
                 : UUID.randomUUID().toString();
 
-        // 1. Route question to a domain using the LLM
         Domain domain = domainRouter.route(request.question());
         log.info("Question routed to domain: {}", domain);
 
         EmbeddingStore<TextSegment> store = domainStores.get(domain);
 
-        // 2. Load conversation history (sliding window: last 10 messages)
         List<ChatMessage> history = memoryService.getRecentMessages(conversationId);
 
-        // 3. RAG — embed the question and search the domain's Pinecone namespace
         Embedding questionEmbedding = embeddingModel.embed(request.question()).content();
         EmbeddingSearchRequest searchRequest = EmbeddingSearchRequest.builder()
                 .queryEmbedding(questionEmbedding)
@@ -78,15 +77,9 @@ public class ChatService {
         List<EmbeddingMatch<TextSegment>> matches = searchResult.matches().stream()
                 .filter(m -> m.score() >= 0.7)
                 .collect(Collectors.toList());
-        log.info("Pinecone search in domain [{}]: found {} matching chunks (after score>=0.7 filter)", domain, matches.size());
-        if (!matches.isEmpty()) {
-            matches.forEach(m -> log.debug("  score={} source={} text={}",
-                    String.format("%.4f", m.score()),
-                    m.embedded().metadata().toMap().get("source"),
-                    m.embedded().text().substring(0, Math.min(100, m.embedded().text().length()))));
-        }
 
-        // 4. Build user message with context (system instructions sent separately via SystemMessage role)
+        log.info("Pinecone search in domain [{}]: {} matching chunks (score >= 0.7)", domain, matches.size());
+
         String context = buildContext(matches);
         String conversationHistory = buildHistory(history);
         String userContent = """
@@ -97,9 +90,6 @@ public class ChatService {
                 %s
                 """.formatted(request.question(), context, conversationHistory);
 
-        log.debug("Full user message to LLM:\n{}", userContent);
-
-        // 5. Call LLM with proper system/user roles
         String answer;
         try {
             var messages = new ArrayList<dev.langchain4j.data.message.ChatMessage>();
@@ -108,15 +98,13 @@ public class ChatService {
             answer = chatModel.generate(messages).content().text();
             log.info("LLM answered successfully for domain [{}]", domain);
         } catch (Exception e) {
-            log.error("LLM call failed [{}]: {}", e.getClass().getName(), e.getMessage(), e);
-            answer = "Sorry, the AI service is temporarily unavailable. Please try again shortly.";
+            log.error("LLM call failed: {}", e.getMessage(), e);
+            throw new ChatProcessingException("The AI service is temporarily unavailable. Please try again shortly.", e);
         }
 
-        // 6. Persist messages to memory
         memoryService.saveMessage(conversationId, "user", request.question());
         memoryService.saveMessage(conversationId, "assistant", answer);
 
-        // 7. Build response with sources, confidence, and routed domain
         List<String> sources = matches.stream()
                 .filter(match -> match.embedded() != null)
                 .map(match -> {
@@ -147,9 +135,7 @@ public class ChatService {
     }
 
     private String buildHistory(List<ChatMessage> history) {
-        if (history.isEmpty()) {
-            return "No prior conversation.";
-        }
+        if (history.isEmpty()) return "No prior conversation.";
         return history.stream()
                 .map(m -> m.getRole() + ": " + m.getContent())
                 .collect(Collectors.joining("\n"));

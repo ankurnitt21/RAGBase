@@ -12,10 +12,10 @@
     </parent>
 
     <groupId>com.enterprise</groupId>
-    <artifactId>ai-assistant</artifactId>
-    <version>0.0.1-SNAPSHOT</version>
-    <name>Enterprise Knowledge Assistant</name>
-    <description>RAG-based knowledge assistant with conversation memory using LangChain4j, Pinecone, and CSV storage</description>
+    <artifactId>ragbase</artifactId>
+    <version>1.0.0</version>
+    <name>RAGBase</name>
+    <description>RAG-based knowledge assistant with LangChain4j, OpenAI, Pinecone, and PostgreSQL</description>
 
     <properties>
         <java.version>21</java.version>
@@ -68,6 +68,18 @@
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-data-jpa</artifactId>
+        </dependency>
+
+        <!-- Actuator -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-actuator</artifactId>
+        </dependency>
+
+        <!-- Validation -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-validation</artifactId>
         </dependency>
 
         <!-- PostgreSQL Driver -->

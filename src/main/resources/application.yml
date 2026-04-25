@@ -3,22 +3,18 @@ server:
 
 spring:
   application:
-    name: ai-assistant
-
-  # File upload limits
+    name: ragbase
+  profiles:
+    active: ${SPRING_PROFILES_ACTIVE:dev}
   servlet:
     multipart:
       max-file-size: 10MB
       max-request-size: 10MB
-
-  # PostgreSQL datasource
   datasource:
     url: jdbc:postgresql://localhost:5432/ai-assisstant
     username: ${DB_USER:postgres}
     password: ${DB_PASSWORD:postgres}
     driver-class-name: org.postgresql.Driver
-
-  # JPA / Hibernate
   jpa:
     hibernate:
       ddl-auto: update
@@ -26,9 +22,8 @@ spring:
     properties:
       hibernate:
         dialect: org.hibernate.dialect.PostgreSQLDialect
-        format_sql: true
 
-# OpenAI — used for gpt-4o-mini (chat) and text-embedding-3-small (embeddings)
+# OpenAI — gpt-4o-mini (chat + routing) and text-embedding-3-small (embeddings)
 openai:
   api-key: ${OPENAI_KEY}
 
@@ -36,6 +31,32 @@ openai:
 pinecone:
   api-key: ${PINECONE_API_KEY}
   index-name: ${PINECONE_INDEX_NAME:knowledge-base}
+
+# API Key auth (set API_KEY env var to enable; leave unset to disable in dev)
+app:
+  security:
+    api-key: ${API_KEY:}
+
+# Actuator
+management:
+  endpoints:
+    web:
+      base-path: /actuator
+      exposure:
+        include: health,info,metrics
+  endpoint:
+    health:
+      show-details: when-authorized
+  info:
+    env:
+      enabled: true
+
+# App info shown at /actuator/info
+info:
+  app:
+    name: RAGBase
+    version: 1.0.0
+    description: RAG-based knowledge assistant
 
 # Swagger / OpenAPI
 springdoc:
@@ -45,8 +66,3 @@ springdoc:
     operations-sorter: alpha
   api-docs:
     path: /v3/api-docs
-
-logging:
-  level:
-    com.enterprise.aiassistant: DEBUG
-    org.springframework.ai: INFO
