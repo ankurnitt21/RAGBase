@@ -36,13 +36,28 @@ public class AiConfig {
     @Value("${pinecone.index-name}")
     private String pineconeIndexName;
 
+    @Value("${openai.api-key}")
+    private String openAiApiKey;
+
+    @Value("${openai.chat-model}")
+    private String chatModelName;
+
+    @Value("${openai.chat-temperature}")
+    private double chatTemperature;
+
+    @Value("${openai.chat-max-tokens}")
+    private int chatMaxTokens;
+
+    @Value("${openai.embedding-model}")
+    private String embeddingModelName;
+
     @Bean
-    ChatLanguageModel chatLanguageModel(@Value("${openai.api-key}") String apiKey) {
+    ChatLanguageModel chatLanguageModel() {
         return OpenAiChatModel.builder()
-                .apiKey(apiKey)
-                .modelName("gpt-4o-mini")
-                .temperature(0.3)
-                .maxTokens(1024)
+                .apiKey(openAiApiKey)
+                .modelName(chatModelName)
+                .temperature(chatTemperature)
+                .maxTokens(chatMaxTokens)
                 .build();
     }
 
@@ -55,10 +70,10 @@ public class AiConfig {
     }
 
     @Bean
-    EmbeddingModel embeddingModel(@Value("${openai.api-key}") String openAiApiKey) {
+    EmbeddingModel embeddingModel() {
         return OpenAiEmbeddingModel.builder()
                 .apiKey(openAiApiKey)
-                .modelName("text-embedding-3-small")
+                .modelName(embeddingModelName)
                 .build();
     }
 

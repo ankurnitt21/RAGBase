@@ -2,7 +2,7 @@ package com.enterprise.aiassistant.service;
 
 import com.enterprise.aiassistant.dto.ChatRequest;
 import com.enterprise.aiassistant.dto.ChatResponse;
-import com.enterprise.aiassistant.dto.Domain;
+import com.enterprise.aiassistant.dto.DomainRoutingResult;
 import com.enterprise.aiassistant.entity.ChatMessage;
 import com.enterprise.aiassistant.exception.ChatProcessingException;
 import io.github.resilience4j.circuitbreaker.annotation.CircuitBreaker;
@@ -39,19 +39,19 @@ public class ChatService {
                 ? request.conversationId()
                 : UUID.randomUUID().toString();
 
-        Domain domain = domainRouter.route(request.question());
-        log.info("Question routed to domain: {}", domain);
+        DomainRoutingResult routing = domainRouter.route(request.question());
+        log.info("Question routed to domain: {} (fallback={})", routing.domain(), routing.fallback());
 
         List<ChatMessage> history = memoryService.getRecentMessages(conversationId);
         String conversationHistory = buildHistory(history);
 
         String answer = chatAssistant.chat(request.question(), conversationHistory);
-        log.info("LLM answered for domain [{}]", domain);
+        log.info("LLM answered for domain [{}]", routing.domain());
 
         memoryService.saveMessage(conversationId, "user", request.question());
         memoryService.saveMessage(conversationId, "assistant", answer);
 
-        return new ChatResponse(answer, "TOOL_BASED", List.of(), domain.name());
+        return new ChatResponse(answer, "TOOL_BASED", List.of(), routing.domain().name(), routing.fallback());
     }
 
     @SuppressWarnings("unused")

@@ -6,6 +6,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 
 import com.enterprise.aiassistant.dto.Domain;
+import com.enterprise.aiassistant.dto.DomainRoutingResult;
 
 import dev.langchain4j.model.chat.ChatLanguageModel;
 
@@ -36,16 +37,16 @@ public class DomainRouterService {
     }
 
     @Retry(name = "llm", fallbackMethod = "routeFallback")
-    public Domain route(String question) {
+    public DomainRoutingResult route(String question) {
         String response = chatModel.generate(ROUTING_PROMPT.formatted(question));
         String cleaned = response.strip().toUpperCase().replaceAll("[^A-Z]", "");
         log.debug("Domain routing: question='{}' → raw='{}' → parsed='{}'", question, response, cleaned);
-        return Domain.valueOf(cleaned);
+        return new DomainRoutingResult(Domain.valueOf(cleaned), false);
     }
 
     @SuppressWarnings("unused")
-    private Domain routeFallback(String question, Exception ex) {
+    private DomainRoutingResult routeFallback(String question, Exception ex) {
         log.warn("Domain routing failed after retries, defaulting to PRODUCT: {}", ex.getMessage());
-        return Domain.PRODUCT;
+        return new DomainRoutingResult(Domain.PRODUCT, true);
     }
 }

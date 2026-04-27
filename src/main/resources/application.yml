@@ -26,6 +26,10 @@ spring:
 # OpenAI — gpt-4o-mini (chat + routing) and text-embedding-3-small (embeddings)
 openai:
   api-key: ${OPENAI_KEY}
+  chat-model: ${OPENAI_CHAT_MODEL:gpt-4o-mini}
+  chat-temperature: ${OPENAI_TEMPERATURE:0.3}
+  chat-max-tokens: ${OPENAI_MAX_TOKENS:1024}
+  embedding-model: ${OPENAI_EMBEDDING_MODEL:text-embedding-3-small}
 
 # Pinecone Vector Store
 pinecone:
@@ -47,6 +51,8 @@ management:
   endpoint:
     health:
       show-details: when-authorized
+      cache:
+        time-to-live: 30s
   info:
     env:
       enabled: true

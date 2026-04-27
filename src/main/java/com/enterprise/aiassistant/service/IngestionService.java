@@ -23,7 +23,7 @@ import java.time.Instant;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.CompletableFuture;
+
 
 @Service
 public class IngestionService {
@@ -32,11 +32,14 @@ public class IngestionService {
 
     private final Map<Domain, EmbeddingStore<TextSegment>> domainStores;
     private final EmbeddingModel embeddingModel;
+    private final IngestionJobStore jobStore;
 
     public IngestionService(Map<Domain, EmbeddingStore<TextSegment>> domainStores,
-                            EmbeddingModel embeddingModel) {
+                            EmbeddingModel embeddingModel,
+                            IngestionJobStore jobStore) {
         this.domainStores = domainStores;
         this.embeddingModel = embeddingModel;
+        this.jobStore = jobStore;
     }
 
     @Retry(name = "pinecone", fallbackMethod = "ingestFallback")
@@ -63,16 +66,17 @@ public class IngestionService {
     }
 
     @Async
-    public CompletableFuture<String> ingestAsync(byte[] fileBytes, String filename, Domain domain) {
-        log.info("Async ingesting '{}' into domain [{}]", filename, domain);
+    public void ingestAsync(String jobId, byte[] fileBytes, String filename, Domain domain) {
+        log.info("Async ingesting job [{}] '{}' into domain [{}]", jobId, filename, domain);
         try {
             Document document = parseFile(new java.io.ByteArrayInputStream(fileBytes), filename,
                     buildMetadata(filename, domain));
             ingestDocument(document, filename, domain);
-            return CompletableFuture.completedFuture("Ingested: " + filename);
+            jobStore.complete(jobId);
+            log.info("Async ingestion completed for job [{}] '{}'", jobId, filename);
         } catch (Exception e) {
-            log.error("Async ingestion failed for '{}': {}", filename, e.getMessage(), e);
-            return CompletableFuture.completedFuture("Failed: " + filename + " — " + e.getMessage());
+            log.error("Async ingestion failed for job [{}] '{}': {}", jobId, filename, e.getMessage(), e);
+            jobStore.fail(jobId, e.getMessage());
         }
     }
 
