@@ -30,7 +30,7 @@ Enterprises have knowledge spread across PDFs and documents that nobody reads. R
 
 ## Flow
 
-### Document Ingestion (`POST /api/v1/documents`)
+### Document Ingestion — sync (`POST /api/v1/documents`)
 
 ```
 User uploads file (PDF / TXT) + selects domain
@@ -55,7 +55,6 @@ Parse file
         │
         ▼
 Split into chunks (300 tokens, 100 token overlap)
-  Overlap preserves context at chunk boundaries
         │
         ▼
 ┌─────────────────────────────────┐
@@ -65,15 +64,46 @@ Split into chunks (300 tokens, 100 token overlap)
 └─────────────────────────────────┘
         │
         ▼
-Embed each chunk
-  OpenAI text-embedding-3-small → 1536-dim vector per chunk
-        │
-        ▼
-Store in Pinecone
+Embed each chunk → Store in Pinecone
   namespace = domain.toLowerCase()  (hr / product / ai)
   metadata  = { source, domain, ingested_at }
         │
-  all retries exhausted → 422 Ingestion Failed (after retries)
+  all retries exhausted → 422 Ingestion Failed
+        │
+        ▼
+{ jobId: null, filename, domain, status: "COMPLETED" }
+```
+
+---
+
+### Document Ingestion — async bulk (`POST /api/v1/documents/bulk`)
+
+```
+User uploads files[] + selects domain
+        │
+        ▼
+[Rate Limiter + MIME Type Check — same as sync]
+        │
+        ▼
+For each file:
+  ┌─────────────────────────────────────────┐
+  │  Register job in IngestionJobStore      │  state: PENDING
+  │  jobId = UUID.randomUUID()              │
+  └─────────────────────────────────────────┘
+        │
+        ▼
+  Dispatch to async thread pool (@Async)
+  Returns { jobId, filename, domain, status: "ACCEPTED" } immediately
+        │ (background)
+        ▼
+  Parse → Embed → Store in Pinecone  (same pipeline as sync)
+        │
+  ┌─────────────────────────────────────────┐
+  │  Update IngestionJobStore               │  state: COMPLETED or FAILED
+  └─────────────────────────────────────────┘
+
+Poll status: GET /api/v1/documents/status/{jobId}
+  → { jobId, filename, domain, state: PENDING|COMPLETED|FAILED, message }
 ```
 
 ---
@@ -101,7 +131,7 @@ User sends { conversationId, question }
         ▼
 1. DOMAIN ROUTING  [@Retry(llm) — up to 3 attempts, 1s wait]
    gpt-4o-mini classifies the question → HR / PRODUCT / AI
-   All retries exhausted → fallback: PRODUCT
+   All retries exhausted → fallback: PRODUCT  (domainFallback: true in response)
         │
         ▼
 2. LOAD CONVERSATION HISTORY
@@ -132,7 +162,7 @@ User sends { conversationId, question }
         │
         ▼
 7. RETURN RESPONSE
-   { answer, confidence: "TOOL_BASED", sources: [], routedDomain }
+   { answer, confidence: "TOOL_BASED", sources: [], routedDomain, domainFallback }
 ```
 
 ---
@@ -155,11 +185,21 @@ Create a database named `ai-assisstant`. Hibernate auto-creates the `chat_messag
 Create a `.env` file in the project root (loaded automatically by spring-dotenv):
 
 ```env
+# Required
 OPENAI_KEY=sk-...
 PINECONE_API_KEY=pcsk_...
 PINECONE_INDEX_NAME=knowledge-base
 DB_USER=postgres
 DB_PASSWORD=your_password
+
+# Optional — LLM tuning (these have defaults, no need to set unless overriding)
+OPENAI_CHAT_MODEL=gpt-4o-mini
+OPENAI_TEMPERATURE=0.3
+OPENAI_MAX_TOKENS=1024
+OPENAI_EMBEDDING_MODEL=text-embedding-3-small
+
+# Optional — rate limiting (default: 30 req/min across all endpoints)
+RATE_LIMIT_RPM=30
 ```
 
 `API_KEY` is optional. Set it to enable API key authentication on all endpoints. Leave it unset to disable auth (useful in dev).
@@ -180,7 +220,8 @@ Server starts at **http://localhost:8080**
 |---|---|---|
 | `POST` | `/api/v1/chat` | Ask a question (domain auto-detected) |
 | `POST` | `/api/v1/documents` | Upload a single document (sync) |
-| `POST` | `/api/v1/documents/bulk` | Upload multiple documents (async) |
+| `POST` | `/api/v1/documents/bulk` | Upload multiple documents (async, returns jobIds) |
+| `GET` | `/api/v1/documents/status/{jobId}` | Poll the status of an async ingestion job |
 | `GET` | `/api/v1/domains` | List available domains |
 
 Supported file formats: `.pdf`, `.txt` — max 10 MB per file. The `Content-Type` header must be `application/pdf` or `text/plain`; anything else is rejected with 415.
@@ -188,10 +229,12 @@ Supported file formats: `.pdf`, `.txt` — max 10 MB per file. The `Content-Type
 **Chat request:**
 ```json
 {
-  "conversationId": "conv-123",
+  "conversationId": "550e8400-e29b-41d4-a716-446655440000",
   "question": "What is our PTO policy?"
 }
 ```
+
+`conversationId` must be a valid UUID or omitted (a new one is generated automatically).
 
 **Chat response:**
 ```json
@@ -199,9 +242,62 @@ Supported file formats: `.pdf`, `.txt` — max 10 MB per file. The `Content-Type
   "answer": "Employees are entitled to 20 days of PTO per year... (source: hr-policy.pdf)",
   "confidence": "TOOL_BASED",
   "sources": [],
-  "routedDomain": "HR"
+  "routedDomain": "HR",
+  "domainFallback": false
 }
 ```
+
+`domainFallback: true` means the LLM-based domain classifier failed after retries and the request was routed to PRODUCT as a default.
+
+**Bulk ingest response** (one entry per file):
+```json
+[
+  {
+    "jobId": "3f6a1b2c-84d0-4e7f-9012-abcdef012345",
+    "filename": "hr-policy.pdf",
+    "domain": "HR",
+    "status": "ACCEPTED",
+    "message": "Queued for async ingestion. Poll /api/v1/documents/status/3f6a1b2c-84d0-4e7f-9012-abcdef012345"
+  }
+]
+```
+
+**Ingestion status response:**
+```json
+{
+  "jobId": "3f6a1b2c-84d0-4e7f-9012-abcdef012345",
+  "filename": "hr-policy.pdf",
+  "domain": "HR",
+  "state": "COMPLETED",
+  "message": "Ingested successfully"
+}
+```
+
+Possible `state` values: `PENDING`, `COMPLETED`, `FAILED`.
+
+---
+
+## Health Monitoring
+
+`GET /actuator/health` reports the status of both external dependencies:
+
+```json
+{
+  "status": "UP",
+  "components": {
+    "openai": {
+      "status": "UP"
+    },
+    "pinecone": {
+      "status": "UP",
+      "details": { "namespaces": 3, "backend": "pinecone" }
+    }
+  }
+}
+```
+
+- **openai** — makes a lightweight embedding call (`text-embedding-3-small`) to verify the API key and network are reachable. Result is cached for 30 seconds to avoid billing on every poll.
+- **pinecone** — checks whether each domain namespace is backed by a live `PineconeEmbeddingStore` or the in-memory fallback. No network call; purely type-based. Possible statuses: `UP` (all Pinecone), `DOWN` (all fallback), `UNKNOWN` (mixed).
 
 ---
 
