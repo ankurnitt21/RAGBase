@@ -1,5 +1,7 @@
 package com.enterprise.aiassistant.exception;
 
+import io.github.resilience4j.circuitbreaker.CallNotPermittedException;
+import io.github.resilience4j.ratelimiter.RequestNotPermitted;
 import jakarta.servlet.http.HttpServletRequest;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -53,6 +55,30 @@ public class GlobalExceptionHandler {
         String message = "Invalid value '" + ex.getValue() + "' for parameter '" + ex.getName() + "'";
         return ResponseEntity.badRequest()
                 .body(ApiError.of(400, "Bad Request", message, req.getRequestURI()));
+    }
+
+    @ExceptionHandler(UnsupportedFileTypeException.class)
+    public ResponseEntity<ApiError> handleUnsupportedFileType(UnsupportedFileTypeException ex, HttpServletRequest req) {
+        return ResponseEntity.status(HttpStatus.UNSUPPORTED_MEDIA_TYPE)
+                .body(ApiError.of(415, "Unsupported Media Type", ex.getMessage(), req.getRequestURI()));
+    }
+
+    @ExceptionHandler(RequestNotPermitted.class)
+    public ResponseEntity<ApiError> handleRateLimit(RequestNotPermitted ex, HttpServletRequest req) {
+        log.warn("Rate limit exceeded for {}", req.getRequestURI());
+        return ResponseEntity.status(429)
+                .body(ApiError.of(429, "Too Many Requests",
+                        "Rate limit exceeded. Please slow down and retry after a moment.",
+                        req.getRequestURI()));
+    }
+
+    @ExceptionHandler(CallNotPermittedException.class)
+    public ResponseEntity<ApiError> handleCircuitOpen(CallNotPermittedException ex, HttpServletRequest req) {
+        log.error("Circuit breaker open for {}: {}", req.getRequestURI(), ex.getMessage());
+        return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)
+                .body(ApiError.of(503, "Service Unavailable",
+                        "Service is temporarily unavailable due to repeated failures. Please try again shortly.",
+                        req.getRequestURI()));
     }
 
     @ExceptionHandler(MaxUploadSizeExceededException.class)

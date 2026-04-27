@@ -4,8 +4,10 @@ import com.enterprise.aiassistant.dto.ChatRequest;
 import com.enterprise.aiassistant.dto.ChatResponse;
 import com.enterprise.aiassistant.dto.Domain;
 import com.enterprise.aiassistant.dto.IngestionResponse;
+import com.enterprise.aiassistant.exception.UnsupportedFileTypeException;
 import com.enterprise.aiassistant.service.ChatService;
 import com.enterprise.aiassistant.service.IngestionService;
+import io.github.resilience4j.ratelimiter.annotation.RateLimiter;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import jakarta.validation.Valid;
@@ -23,12 +25,15 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Set;
 
 @RestController
 @RequestMapping("/api/v1")
 @Validated
 @Tag(name = "RAGBase", description = "RAG-based document Q&A with domain routing")
 public class AssistantController {
+
+    private static final Set<String> ALLOWED_CONTENT_TYPES = Set.of("application/pdf", "text/plain");
 
     private final ChatService chatService;
     private final IngestionService ingestionService;
@@ -40,15 +45,18 @@ public class AssistantController {
 
     @Operation(summary = "Chat", description = "Ask a question. Domain (HR / PRODUCT / AI) is auto-detected via LLM routing.")
     @PostMapping("/chat")
+    @RateLimiter(name = "api")
     public ChatResponse chat(@Valid @RequestBody ChatRequest request) {
         return chatService.chat(request);
     }
 
     @Operation(summary = "Ingest document (sync)", description = "Upload a single PDF or .txt file into a domain namespace. Blocks until done.")
     @PostMapping(value = "/documents", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
+    @RateLimiter(name = "api")
     public IngestionResponse ingestDocument(
             @RequestParam MultipartFile file,
             @RequestParam Domain domain) {
+        validateMimeType(file);
         ingestionService.ingest(file, domain);
         return new IngestionResponse(file.getOriginalFilename(), domain, "COMPLETED",
                 "Ingested successfully into " + domain + " namespace");
@@ -56,11 +64,13 @@ public class AssistantController {
 
     @Operation(summary = "Ingest documents (async bulk)", description = "Upload multiple files. Returns immediately; ingestion runs in background.")
     @PostMapping(value = "/documents/bulk", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
+    @RateLimiter(name = "api")
     public List<IngestionResponse> ingestBulk(
             @RequestParam MultipartFile[] files,
             @RequestParam Domain domain) throws IOException {
         List<IngestionResponse> responses = new ArrayList<>();
         for (MultipartFile file : files) {
+            validateMimeType(file);
             ingestionService.ingestAsync(file.getBytes(), file.getOriginalFilename(), domain);
             responses.add(new IngestionResponse(file.getOriginalFilename(), domain, "ACCEPTED",
                     "Queued for async ingestion into " + domain + " namespace"));
@@ -70,7 +80,16 @@ public class AssistantController {
 
     @Operation(summary = "List domains", description = "Returns supported domain namespaces.")
     @GetMapping("/domains")
+    @RateLimiter(name = "api")
     public List<String> getDomains() {
         return Arrays.stream(Domain.values()).map(Enum::name).toList();
+    }
+
+    private void validateMimeType(MultipartFile file) {
+        String contentType = file.getContentType();
+        if (contentType == null || !ALLOWED_CONTENT_TYPES.contains(contentType)) {
+            throw new UnsupportedFileTypeException(
+                    "Unsupported file type: '" + contentType + "'. Allowed types: application/pdf, text/plain");
+        }
     }
 }

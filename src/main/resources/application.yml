@@ -58,6 +58,39 @@ info:
     version: 1.0.0
     description: RAG-based knowledge assistant
 
+# Resilience4j: rate limiter, retry, circuit breaker
+resilience4j:
+  ratelimiter:
+    instances:
+      api:
+        limit-for-period: ${RATE_LIMIT_RPM:30}
+        limit-refresh-period: 1m
+        timeout-duration: 0
+  retry:
+    instances:
+      llm:
+        max-attempts: 3
+        wait-duration: 1s
+        ignore-exceptions:
+          - com.enterprise.aiassistant.exception.ChatProcessingException
+          - com.enterprise.aiassistant.exception.DocumentIngestionException
+          - com.enterprise.aiassistant.exception.UnsupportedFileTypeException
+      pinecone:
+        max-attempts: 3
+        wait-duration: 2s
+        ignore-exceptions:
+          - com.enterprise.aiassistant.exception.DocumentIngestionException
+          - com.enterprise.aiassistant.exception.UnsupportedFileTypeException
+          - java.io.IOException
+  circuit-breaker:
+    instances:
+      llm:
+        sliding-window-size: 10
+        failure-rate-threshold: 50
+        wait-duration-in-open-state: 30s
+        permitted-number-of-calls-in-half-open-state: 3
+        minimum-number-of-calls: 5
+
 # Swagger / OpenAPI
 springdoc:
   swagger-ui:

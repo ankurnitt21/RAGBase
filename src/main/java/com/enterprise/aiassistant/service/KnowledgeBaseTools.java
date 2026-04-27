@@ -5,6 +5,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
 
+import io.github.resilience4j.retry.annotation.Retry;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
 import com.enterprise.aiassistant.dto.Domain;
@@ -21,6 +24,8 @@ import dev.langchain4j.store.embedding.EmbeddingStore;
 @Component
 public class KnowledgeBaseTools {
 
+    private static final Logger log = LoggerFactory.getLogger(KnowledgeBaseTools.class);
+
     private final EmbeddingModel embeddingModel;
     private final Map<Domain, EmbeddingStore<TextSegment>> domainStores;
 
@@ -32,6 +37,7 @@ public class KnowledgeBaseTools {
 
     @Tool("Search the enterprise knowledge base for documents relevant to a query. " +
           "Call this before answering any factual question. You may call it multiple times with refined queries.")
+    @Retry(name = "pinecone", fallbackMethod = "searchFallback")
     public String searchKnowledgeBase(
             @P("The search query to find relevant documents") String query,
             @P("The domain to search in. Must be one of: HR, PRODUCT, AI") String domain) {
@@ -69,6 +75,12 @@ public class KnowledgeBaseTools {
                     .formatted(i + 1, source != null ? source : "unknown", match.score(), match.embedded().text()));
         }
         return sb.toString();
+    }
+
+    @SuppressWarnings("unused")
+    private String searchFallback(String query, String domain, Exception ex) {
+        log.error("Knowledge base search failed for domain [{}] after retries: {}", domain, ex.getMessage());
+        return "Knowledge base is temporarily unavailable. Unable to retrieve relevant documents for: " + query;
     }
 
     @Tool("List all knowledge domains available in the knowledge base.")

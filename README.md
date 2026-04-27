@@ -22,6 +22,7 @@ Enterprises have knowledge spread across PDFs and documents that nobody reads. R
 | Embeddings | OpenAI `text-embedding-3-small` (1536-dim) |
 | Vector DB | Pinecone (cosine, namespaces: hr / product / ai) |
 | Conversation Memory | PostgreSQL |
+| Resilience | Resilience4j (rate limiter, retry, circuit breaker) |
 | API Docs | Swagger UI (`/swagger-ui.html`) |
 | Build | Maven Wrapper (`mvnw`) |
 
@@ -35,13 +36,33 @@ Enterprises have knowledge spread across PDFs and documents that nobody reads. R
 User uploads file (PDF / TXT) + selects domain
         │
         ▼
+┌─────────────────────────────────┐
+│  RATE LIMITER  @RateLimiter     │  30 req/min (shared across all endpoints)
+│  RequestNotPermitted → 429      │
+└─────────────────────────────────┘
+        │
+        ▼
+┌─────────────────────────────────┐
+│  MIME TYPE CHECK  (controller)  │  Allowed: application/pdf, text/plain
+│  UnsupportedFileTypeException   │  → 415 Unsupported Media Type
+└─────────────────────────────────┘
+        │
+        ▼
 Parse file
-  ├── PDF  → ApachePdfBox extracts text (rejects scanned/image PDFs)
+  ├── PDF  → ApachePdfBox extracts text
+  │         scanned/image PDF (no text) → 422 Unprocessable Entity
   └── TXT  → read as plain text
         │
         ▼
 Split into chunks (300 tokens, 100 token overlap)
   Overlap preserves context at chunk boundaries
+        │
+        ▼
+┌─────────────────────────────────┐
+│  RETRY  @Retry(pinecone)        │  up to 3 attempts, 2s between each
+│  ignores: DocumentIngestion-    │  DocumentIngestionException and
+│  Exception, IOException         │  IOException are not retried
+└─────────────────────────────────┘
         │
         ▼
 Embed each chunk
@@ -51,6 +72,8 @@ Embed each chunk
 Store in Pinecone
   namespace = domain.toLowerCase()  (hr / product / ai)
   metadata  = { source, domain, ingested_at }
+        │
+  all retries exhausted → 422 Ingestion Failed (after retries)
 ```
 
 ---
@@ -61,27 +84,43 @@ Store in Pinecone
 User sends { conversationId, question }
         │
         ▼
-1. DOMAIN ROUTING
+┌─────────────────────────────────┐
+│  RATE LIMITER  @RateLimiter     │  30 req/min (shared across all endpoints)
+│  RequestNotPermitted → 429      │
+└─────────────────────────────────┘
+        │
+        ▼
+┌──────────────────────────────────────────────────────────────┐
+│  CIRCUIT BREAKER + RETRY  @CircuitBreaker(llm) @Retry(llm)  │
+│  Retry: up to 3 attempts, 1s wait                            │
+│  Circuit Breaker: opens after 50% failures in 10 calls,      │
+│    stays open 30s, then half-open (3 probe calls)            │
+│  CB open or all retries exhausted → 503 Service Unavailable  │
+└──────────────────────────────────────────────────────────────┘
+        │
+        ▼
+1. DOMAIN ROUTING  [@Retry(llm) — up to 3 attempts, 1s wait]
    gpt-4o-mini classifies the question → HR / PRODUCT / AI
-   Falls back to PRODUCT if classification fails
+   All retries exhausted → fallback: PRODUCT
         │
         ▼
 2. LOAD CONVERSATION HISTORY
    PostgreSQL: last 10 messages for the conversation
         │
         ▼
-3. CALL LLM (agentic)
+3. CALL LLM  (agentic)
    ChatAssistant receives the question + history
    System prompt instructs it to call searchKnowledgeBase before answering
         │
         ▼
 4. LLM CALLS TOOL (zero or more times)
-   searchKnowledgeBase(query, domain)
+   searchKnowledgeBase(query, domain)  [@Retry(pinecone) — up to 3 attempts, 2s wait]
      ├── Embed query → OpenAI text-embedding-3-small
      ├── Search Pinecone namespace (cosine similarity, top 5)
      ├── Filter: keep chunks with score ≥ 0.7
      └── Return formatted excerpts + source filenames to LLM
    LLM may call this multiple times with refined queries
+   All retries exhausted → "Knowledge base temporarily unavailable" returned to LLM
         │
         ▼
 5. LLM GENERATES ANSWER
@@ -144,7 +183,7 @@ Server starts at **http://localhost:8080**
 | `POST` | `/api/v1/documents/bulk` | Upload multiple documents (async) |
 | `GET` | `/api/v1/domains` | List available domains |
 
-Supported file formats: `.pdf`, `.txt` — max 10 MB per file.
+Supported file formats: `.pdf`, `.txt` — max 10 MB per file. The `Content-Type` header must be `application/pdf` or `text/plain`; anything else is rejected with 415.
 
 **Chat request:**
 ```json

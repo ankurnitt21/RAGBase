@@ -3,6 +3,7 @@ package com.enterprise.aiassistant.service;
 import com.enterprise.aiassistant.dto.Domain;
 import com.enterprise.aiassistant.exception.DocumentIngestionException;
 import dev.langchain4j.data.document.Document;
+import io.github.resilience4j.retry.annotation.Retry;
 import dev.langchain4j.data.document.DocumentSplitter;
 import dev.langchain4j.data.document.Metadata;
 import dev.langchain4j.data.document.parser.apache.pdfbox.ApachePdfBoxDocumentParser;
@@ -38,6 +39,7 @@ public class IngestionService {
         this.embeddingModel = embeddingModel;
     }
 
+    @Retry(name = "pinecone", fallbackMethod = "ingestFallback")
     public void ingest(MultipartFile file, Domain domain) {
         String filename = file.getOriginalFilename();
         log.info("Ingesting '{}' into domain [{}]", filename, domain);
@@ -50,6 +52,14 @@ public class IngestionService {
         } catch (IOException e) {
             throw new DocumentIngestionException("Failed to read file: " + filename, e);
         }
+    }
+
+    @SuppressWarnings("unused")
+    private void ingestFallback(MultipartFile file, Domain domain, Exception ex) {
+        String filename = file.getOriginalFilename();
+        log.error("Ingestion failed for '{}' after retries: {}", filename, ex.getMessage(), ex);
+        throw new DocumentIngestionException(
+                "Ingestion failed after retries. Please try again later.", ex);
     }
 
     @Async

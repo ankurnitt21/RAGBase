@@ -5,6 +5,8 @@ import com.enterprise.aiassistant.dto.ChatResponse;
 import com.enterprise.aiassistant.dto.Domain;
 import com.enterprise.aiassistant.entity.ChatMessage;
 import com.enterprise.aiassistant.exception.ChatProcessingException;
+import io.github.resilience4j.circuitbreaker.annotation.CircuitBreaker;
+import io.github.resilience4j.retry.annotation.Retry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
@@ -30,6 +32,8 @@ public class ChatService {
         this.domainRouter = domainRouter;
     }
 
+    @CircuitBreaker(name = "llm", fallbackMethod = "chatFallback")
+    @Retry(name = "llm")
     public ChatResponse chat(ChatRequest request) {
         String conversationId = request.conversationId() != null
                 ? request.conversationId()
@@ -41,19 +45,19 @@ public class ChatService {
         List<ChatMessage> history = memoryService.getRecentMessages(conversationId);
         String conversationHistory = buildHistory(history);
 
-        String answer;
-        try {
-            answer = chatAssistant.chat(request.question(), conversationHistory);
-            log.info("LLM answered for domain [{}]", domain);
-        } catch (Exception e) {
-            log.error("LLM call failed: {}", e.getMessage(), e);
-            throw new ChatProcessingException("The AI service is temporarily unavailable. Please try again shortly.", e);
-        }
+        String answer = chatAssistant.chat(request.question(), conversationHistory);
+        log.info("LLM answered for domain [{}]", domain);
 
         memoryService.saveMessage(conversationId, "user", request.question());
         memoryService.saveMessage(conversationId, "assistant", answer);
 
         return new ChatResponse(answer, "TOOL_BASED", List.of(), domain.name());
+    }
+
+    @SuppressWarnings("unused")
+    private ChatResponse chatFallback(ChatRequest request, Exception ex) {
+        log.error("LLM call failed after retries: {}", ex.getMessage(), ex);
+        throw new ChatProcessingException("The AI service is temporarily unavailable. Please try again shortly.", ex);
     }
 
     private String buildHistory(List<ChatMessage> history) {

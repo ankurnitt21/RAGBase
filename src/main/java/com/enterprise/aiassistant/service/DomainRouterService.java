@@ -1,5 +1,6 @@
 package com.enterprise.aiassistant.service;
 
+import io.github.resilience4j.retry.annotation.Retry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
@@ -8,10 +9,6 @@ import com.enterprise.aiassistant.dto.Domain;
 
 import dev.langchain4j.model.chat.ChatLanguageModel;
 
-/**
- * Uses the LLM to classify a user question into one of the supported domains.
- * This lets us search only the relevant Pinecone namespace instead of all namespaces.
- */
 @Service
 public class DomainRouterService {
 
@@ -38,19 +35,17 @@ public class DomainRouterService {
         this.chatModel = chatModel;
     }
 
-    /**
-     * Classifies the question into a Domain using a lightweight LLM call.
-     * Falls back to PRODUCT if classification fails.
-     */
+    @Retry(name = "llm", fallbackMethod = "routeFallback")
     public Domain route(String question) {
-        try {
-            String response = chatModel.generate(ROUTING_PROMPT.formatted(question));
-            String cleaned = response.strip().toUpperCase().replaceAll("[^A-Z]", "");
-            log.debug("Domain routing: question='{}' → raw='{}' → parsed='{}'", question, response, cleaned);
-            return Domain.valueOf(cleaned);
-        } catch (Exception e) {
-            log.warn("Domain routing failed, defaulting to PRODUCT: {}", e.getMessage());
-            return Domain.PRODUCT;
-        }
+        String response = chatModel.generate(ROUTING_PROMPT.formatted(question));
+        String cleaned = response.strip().toUpperCase().replaceAll("[^A-Z]", "");
+        log.debug("Domain routing: question='{}' → raw='{}' → parsed='{}'", question, response, cleaned);
+        return Domain.valueOf(cleaned);
+    }
+
+    @SuppressWarnings("unused")
+    private Domain routeFallback(String question, Exception ex) {
+        log.warn("Domain routing failed after retries, defaulting to PRODUCT: {}", ex.getMessage());
+        return Domain.PRODUCT;
     }
 }
