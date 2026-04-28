@@ -539,7 +539,7 @@
       }
 
       function newConversation() {
-        const id = 'conv-' + Date.now();
+        const id = generateConversationId();
         conversations[id] = { name: 'New Chat', messages: [] };
         saveConversations();
         setActiveConversation(id);
@@ -650,10 +650,15 @@
         document.getElementById('sendBtn').disabled = true;
 
         try {
+          // Backward compatibility: older localStorage entries used "conv-<timestamp>".
+          // The backend now validates conversationId as UUID, so invalid legacy IDs
+          // must be treated as "new conversation" by sending null.
+          const conversationId = isValidUuid(activeConvId) ? activeConvId : null;
+
           const res = await fetch(API + '/chat', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ conversationId: activeConvId, question })
+            body: JSON.stringify({ conversationId, question })
           });
 
           if (!res.ok) throw new Error('Server returned ' + res.status);
@@ -778,6 +783,23 @@
         const div = document.createElement('div');
         div.textContent = text;
         return div.innerHTML;
+      }
+
+      function generateConversationId() {
+        if (window.crypto && typeof window.crypto.randomUUID === 'function') {
+          return window.crypto.randomUUID();
+        }
+        // Fallback for older browsers: RFC4122-ish v4 UUID.
+        return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+          const r = Math.random() * 16 | 0;
+          const v = c === 'x' ? r : ((r & 0x3) | 0x8);
+          return v.toString(16);
+        });
+      }
+
+      function isValidUuid(value) {
+        return typeof value === 'string' &&
+          /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
       }
 
       // ── Init ────────────────────────────────────────────
