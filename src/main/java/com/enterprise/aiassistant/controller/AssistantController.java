@@ -32,6 +32,17 @@ import java.util.List;
 import java.util.Set;
 import java.util.UUID;
 
+/**
+ * REST API surface for RAGBase. Exposes five endpoints:
+ *   POST /api/v1/chat                     — ask a question (domain auto-detected)
+ *   POST /api/v1/documents                — ingest a single file (sync, blocks until done)
+ *   POST /api/v1/documents/bulk           — ingest multiple files (async, returns jobIds)
+ *   GET  /api/v1/documents/status/{jobId} — poll async ingestion job status
+ *   GET  /api/v1/domains                  — list available domain namespaces
+ *
+ * All endpoints are rate-limited (30 req/min shared). MIME type validation
+ * runs before ingestion; only application/pdf and text/plain are accepted.
+ */
 @RestController
 @RequestMapping("/api/v1")
 @Validated

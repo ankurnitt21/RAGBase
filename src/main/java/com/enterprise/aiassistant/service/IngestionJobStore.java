@@ -6,6 +6,14 @@ import org.springframework.stereotype.Component;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 
+/**
+ * In-memory store for async bulk ingestion job statuses.
+ * Each file uploaded via POST /api/v1/documents/bulk gets a UUID jobId
+ * registered here as PENDING. The background thread updates it to
+ * COMPLETED or FAILED when ingestion finishes. Clients poll
+ * GET /api/v1/documents/status/{jobId} to check progress.
+ * State is lost on restart — jobs in flight will never complete.
+ */
 @Component
 public class IngestionJobStore {
 

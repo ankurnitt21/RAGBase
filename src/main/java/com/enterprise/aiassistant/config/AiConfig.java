@@ -1,17 +1,22 @@
 package com.enterprise.aiassistant.config;
 
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.util.EnumMap;
 import java.util.Map;
+import java.util.concurrent.Executor;
+import java.util.concurrent.Executors;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.core.io.Resource;
+import org.springframework.core.io.ResourceLoader;
 import org.springframework.scheduling.annotation.EnableAsync;
 
 import com.enterprise.aiassistant.dto.Domain;
-
 import com.enterprise.aiassistant.service.ChatAssistant;
 import com.enterprise.aiassistant.service.KnowledgeBaseTools;
 import dev.langchain4j.data.segment.TextSegment;
@@ -24,6 +29,12 @@ import dev.langchain4j.store.embedding.EmbeddingStore;
 import dev.langchain4j.store.embedding.inmemory.InMemoryEmbeddingStore;
 import dev.langchain4j.store.embedding.pinecone.PineconeEmbeddingStore;
 
+/**
+ * Wires all AI infrastructure beans: ChatLanguageModel (gpt-4o-mini),
+ * EmbeddingModel (text-embedding-3-small), ChatAssistant (AiServices proxy
+ * with tool registration and system prompt), and per-domain Pinecone embedding
+ * stores with in-memory fallback when Pinecone is unreachable.
+ */
 @Configuration
 @EnableAsync
 public class AiConfig {
@@ -51,6 +62,15 @@ public class AiConfig {
     @Value("${openai.embedding-model}")
     private String embeddingModelName;
 
+    @Value("${app.prompts.chat-system}")
+    private String chatSystemPromptPath;
+
+    private final ResourceLoader resourceLoader;
+
+    public AiConfig(ResourceLoader resourceLoader) {
+        this.resourceLoader = resourceLoader;
+    }
+
     @Bean
     ChatLanguageModel chatLanguageModel() {
         return OpenAiChatModel.builder()
@@ -63,9 +83,12 @@ public class AiConfig {
 
     @Bean
     ChatAssistant chatAssistant(ChatLanguageModel chatLanguageModel, KnowledgeBaseTools knowledgeBaseTools) {
+        String systemPrompt = loadPrompt(chatSystemPromptPath);
+        log.info("Loaded chat system prompt from: {}", chatSystemPromptPath);
         return AiServices.builder(ChatAssistant.class)
                 .chatLanguageModel(chatLanguageModel)
                 .tools(knowledgeBaseTools)
+                .systemMessageProvider(memoryId -> systemPrompt)
                 .build();
     }
 
@@ -77,11 +100,6 @@ public class AiConfig {
                 .build();
     }
 
-    /**
-     * Creates one EmbeddingStore per Domain. Uses Pinecone if reachable,
-     * falls back to InMemoryEmbeddingStore if Pinecone times out or is misconfigured.
-     * This ensures the app always starts even without network access to Pinecone.
-     */
     @Bean
     Map<Domain, EmbeddingStore<TextSegment>> domainEmbeddingStores() {
         Map<Domain, EmbeddingStore<TextSegment>> stores = new EnumMap<>(Domain.class);
@@ -103,5 +121,25 @@ public class AiConfig {
             }
         }
         return stores;
+    }
+
+    /**
+     * Virtual-thread executor for the chat pipeline's parallel phase.
+     * Each task (history load, hasHistory check, domain routing) gets its own
+     * virtual thread, so blocking I/O (database, OpenAI) does not consume
+     * platform threads while waiting.
+     */
+    @Bean("pipelineExecutor")
+    public Executor pipelineExecutor() {
+        return Executors.newVirtualThreadPerTaskExecutor();
+    }
+
+    private String loadPrompt(String path) {
+        try {
+            Resource resource = resourceLoader.getResource(path);
+            return resource.getContentAsString(StandardCharsets.UTF_8);
+        } catch (IOException e) {
+            throw new IllegalStateException("Failed to load prompt from: " + path, e);
+        }
     }
 }

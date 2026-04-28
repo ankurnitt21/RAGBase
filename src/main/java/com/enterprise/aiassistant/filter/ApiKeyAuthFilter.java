@@ -17,6 +17,13 @@ import org.springframework.web.filter.OncePerRequestFilter;
 
 import java.io.IOException;
 
+/**
+ * Servlet filter that enforces API key authentication via the X-API-Key header.
+ * Authentication is only active when app.security.api-key is set in the environment.
+ * When the key is blank (default in dev), all requests pass through unauthenticated.
+ * Skips auth for /actuator, /swagger-ui, /v3/api-docs, and static UI paths.
+ * Returns HTTP 401 with an ApiError body for missing or invalid keys.
+ */
 @Component
 @Order(2)
 public class ApiKeyAuthFilter extends OncePerRequestFilter {

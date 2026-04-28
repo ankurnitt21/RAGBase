@@ -14,6 +14,13 @@ import org.springframework.web.filter.OncePerRequestFilter;
 import java.io.IOException;
 import java.util.UUID;
 
+/**
+ * Servlet filter that assigns a short random requestId to every incoming request,
+ * adds it to the MDC (so it appears in all log lines for that request), and sets
+ * it as the X-Request-Id response header for client-side correlation. Also logs
+ * method, path, response status, and duration after the request completes.
+ * Runs first in the filter chain (Order 1).
+ */
 @Component
 @Order(1)
 public class RequestLoggingFilter extends OncePerRequestFilter {

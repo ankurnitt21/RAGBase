@@ -7,6 +7,12 @@ management:
     health:
       show-details: always
 
+app:
+  prompts:
+    chat-system: classpath:prompts-dev/chat-system.st
+    domain-router: classpath:prompts-dev/domain-router.st
+    query-rewriter: classpath:prompts-dev/query-rewriter.st
+
 logging:
   level:
     com.enterprise.aiassistant: DEBUG

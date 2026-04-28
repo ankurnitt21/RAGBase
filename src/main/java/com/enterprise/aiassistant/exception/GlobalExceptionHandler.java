@@ -17,6 +17,12 @@ import org.springframework.web.multipart.MaxUploadSizeExceededException;
 
 import java.util.stream.Collectors;
 
+/**
+ * Centralised exception-to-HTTP-response mapping for all controllers.
+ * Every known exception type is caught here and converted to a structured
+ * ApiError response body with an appropriate HTTP status code.
+ * Unhandled exceptions fall through to the catch-all handler returning 500.
+ */
 @RestControllerAdvice
 public class GlobalExceptionHandler {
 

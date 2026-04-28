@@ -11,6 +11,12 @@ import org.springframework.stereotype.Component;
 
 import java.util.Map;
 
+/**
+ * Actuator health check for Pinecone. Inspects the type of each domain's
+ * EmbeddingStore — PineconeEmbeddingStore (live) vs InMemoryEmbeddingStore
+ * (fallback). No network call is made. Status: UP (all Pinecone),
+ * DOWN (all in-memory), UNKNOWN (mixed). Reported at GET /actuator/health.
+ */
 @Component("pinecone")
 public class PineconeHealthIndicator implements HealthIndicator {
 

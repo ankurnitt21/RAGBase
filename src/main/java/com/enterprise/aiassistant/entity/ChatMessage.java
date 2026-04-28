@@ -9,6 +9,12 @@ import jakarta.persistence.Index;
 import jakarta.persistence.Table;
 import java.time.LocalDateTime;
 
+/**
+ * JPA entity for conversation history. Each user question and each assistant
+ * reply is stored as a separate row with the same conversation_id, allowing
+ * MemoryService to reconstruct the full conversation ordered by created_at.
+ * Indexed on conversation_id for fast per-conversation queries.
+ */
 @Entity
 @Table(name = "chat_messages", indexes = {
         @Index(name = "idx_chat_messages_conversation_id", columnList = "conversation_id")

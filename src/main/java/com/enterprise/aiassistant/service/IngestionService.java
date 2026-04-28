@@ -1,7 +1,9 @@
 package com.enterprise.aiassistant.service;
 
 import com.enterprise.aiassistant.dto.Domain;
+import com.enterprise.aiassistant.entity.DocumentChunk;
 import com.enterprise.aiassistant.exception.DocumentIngestionException;
+import com.enterprise.aiassistant.repository.DocumentChunkRepository;
 import dev.langchain4j.data.document.Document;
 import io.github.resilience4j.retry.annotation.Retry;
 import dev.langchain4j.data.document.DocumentSplitter;
@@ -25,6 +27,19 @@ import java.util.List;
 import java.util.Map;
 
 
+/**
+ * Parses uploaded files, splits them into chunks, and writes them to two
+ * stores in parallel: Pinecone (vector embeddings for semantic search) and
+ * PostgreSQL document_chunks table (full-text for keyword search).
+ *
+ * Supports two ingestion modes:
+ *   ingest()      — synchronous, called from POST /api/v1/documents
+ *   ingestAsync() — async (@Async), called from POST /api/v1/documents/bulk,
+ *                   job status tracked in IngestionJobStore
+ *
+ * Supported file types: PDF (Apache PDFBox) and plain text. Scanned/image
+ * PDFs are rejected with DocumentIngestionException.
+ */
 @Service
 public class IngestionService {
 
@@ -33,13 +48,16 @@ public class IngestionService {
     private final Map<Domain, EmbeddingStore<TextSegment>> domainStores;
     private final EmbeddingModel embeddingModel;
     private final IngestionJobStore jobStore;
+    private final DocumentChunkRepository documentChunkRepository;
 
     public IngestionService(Map<Domain, EmbeddingStore<TextSegment>> domainStores,
                             EmbeddingModel embeddingModel,
-                            IngestionJobStore jobStore) {
+                            IngestionJobStore jobStore,
+                            DocumentChunkRepository documentChunkRepository) {
         this.domainStores = domainStores;
         this.embeddingModel = embeddingModel;
         this.jobStore = jobStore;
+        this.documentChunkRepository = documentChunkRepository;
     }
 
     @Retry(name = "pinecone", fallbackMethod = "ingestFallback")
@@ -101,6 +119,7 @@ public class IngestionService {
         List<TextSegment> chunks = splitter.split(document);
         log.info("'{}' split into {} chunks for domain [{}]", filename, chunks.size(), domain);
 
+        // Vector store (Pinecone) — for semantic search
         EmbeddingStoreIngestor.builder()
                 .documentSplitter(splitter)
                 .embeddingModel(embeddingModel)
@@ -108,7 +127,14 @@ public class IngestionService {
                 .build()
                 .ingest(document);
 
-        log.info("Successfully ingested '{}' ({} chunks) into domain [{}]", filename, chunks.size(), domain);
+        // PostgreSQL — for keyword (BM25-style) search via full-text index
+        List<DocumentChunk> dbChunks = chunks.stream()
+                .map(chunk -> new DocumentChunk(domain.name(), chunk.text(), filename != null ? filename : "unknown"))
+                .toList();
+        documentChunkRepository.saveAll(dbChunks);
+
+        log.info("Successfully ingested '{}' ({} chunks) into domain [{}] — Pinecone + PostgreSQL",
+                 filename, chunks.size(), domain);
     }
 
     private Map<String, String> buildMetadata(String filename, Domain domain) {

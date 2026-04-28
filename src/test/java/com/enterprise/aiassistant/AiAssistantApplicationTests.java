@@ -29,7 +29,7 @@ class AiAssistantApplicationTests {
 
     @Test
     void chatResponseRecordIncludesRoutedDomain() {
-        ChatResponse res = new ChatResponse("answer", "HIGH", List.of("doc.pdf"), "HR");
+        ChatResponse res = new ChatResponse("answer", "HIGH", List.of("doc.pdf"), "HR", false);
         assertEquals("answer", res.answer());
         assertEquals("HIGH", res.confidence());
         assertEquals(List.of("doc.pdf"), res.sources());
@@ -47,7 +47,7 @@ class AiAssistantApplicationTests {
 
     @Test
     void ingestionResponseRecordWorks() {
-        IngestionResponse res = new IngestionResponse("test.pdf", Domain.AI, "COMPLETED", "ok");
+        IngestionResponse res = new IngestionResponse(null, "test.pdf", Domain.AI, "COMPLETED", "ok");
         assertEquals("test.pdf", res.filename());
         assertEquals(Domain.AI, res.domain());
         assertEquals("COMPLETED", res.status());
