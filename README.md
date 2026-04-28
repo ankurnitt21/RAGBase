@@ -1,327 +1,165 @@
 # RAGBase
 
-A RAG (Retrieval-Augmented Generation) knowledge assistant. Upload documents, ask questions, get cited answers. Uses LangChain4j to orchestrate the pipeline, OpenAI for embeddings and chat, and Pinecone for vector storage.
+RAGBase is a Spring Boot knowledge assistant that ingests documents and answers questions with citations.
+It uses OpenAI for chat/embeddings, Pinecone for vector retrieval, PostgreSQL for persistence + keyword search, and Redis for semantic answer caching.
 
-Questions are automatically routed to the correct domain (HR / PRODUCT / AI) before searching, so only relevant documents are queried.
+## Highlights
 
----
-
-## What It Solves
-
-Enterprises have knowledge spread across PDFs and documents that nobody reads. RAGBase lets you upload those documents and ask natural language questions — getting precise, cited answers instead of digging through files manually.
-
----
+- Domain-aware Q&A (`HR`, `PRODUCT`, `AI`) with fallback behavior
+- Hybrid retrieval: Pinecone vector search + PostgreSQL full-text search
+- Grounding confidence (`HIGH`, `MEDIUM`, `LOW`) from a post-answer verification step
+- Conversation memory with token-budget controls
+- Semantic cache in Redis to skip repeated full pipelines
+- Sync and async document ingestion APIs
 
 ## Tech Stack
 
 | Layer | Technology |
 |---|---|
-| Backend | Java 21, Spring Boot 3.4.1 |
-| AI Framework | LangChain4j 0.36.2 (AiServices, @Tool) |
-| LLM | OpenAI `gpt-4o-mini` |
-| Embeddings | OpenAI `text-embedding-3-small` (1536-dim) |
-| Vector DB | Pinecone (cosine, namespaces: hr / product / ai) |
-| Conversation Memory | PostgreSQL |
+| Runtime | Java 21, Spring Boot 3.4.1 |
+| AI | LangChain4j 0.36.2, OpenAI (`gpt-4o-mini`, `text-embedding-3-small`) |
+| Vector DB | Pinecone (cosine, namespaces per domain) |
+| Relational DB | PostgreSQL (JPA + full-text search) |
+| Cache | Redis Stack (semantic cache index) |
 | Resilience | Resilience4j (rate limiter, retry, circuit breaker) |
 | API Docs | Swagger UI (`/swagger-ui.html`) |
-| Build | Maven Wrapper (`mvnw`) |
 
----
+## Architecture (Chat Path)
 
-## Flow
-
-### Document Ingestion — sync (`POST /api/v1/documents`)
-
-```
-User uploads file (PDF / TXT) + selects domain
-        │
-        ▼
-┌─────────────────────────────────┐
-│  RATE LIMITER  @RateLimiter     │  30 req/min (shared across all endpoints)
-│  RequestNotPermitted → 429      │
-└─────────────────────────────────┘
-        │
-        ▼
-┌─────────────────────────────────┐
-│  MIME TYPE CHECK  (controller)  │  Allowed: application/pdf, text/plain
-│  UnsupportedFileTypeException   │  → 415 Unsupported Media Type
-└─────────────────────────────────┘
-        │
-        ▼
-Parse file
-  ├── PDF  → ApachePdfBox extracts text
-  │         scanned/image PDF (no text) → 422 Unprocessable Entity
-  └── TXT  → read as plain text
-        │
-        ▼
-Split into chunks (300 tokens, 100 token overlap)
-        │
-        ▼
-┌─────────────────────────────────┐
-│  RETRY  @Retry(pinecone)        │  up to 3 attempts, 2s between each
-│  ignores: DocumentIngestion-    │  DocumentIngestionException and
-│  Exception, IOException         │  IOException are not retried
-└─────────────────────────────────┘
-        │
-        ▼
-Embed each chunk → Store in Pinecone
-  namespace = domain.toLowerCase()  (hr / product / ai)
-  metadata  = { source, domain, ingested_at }
-        │
-  all retries exhausted → 422 Ingestion Failed
-        │
-        ▼
-{ jobId: null, filename, domain, status: "COMPLETED" }
-```
-
----
-
-### Document Ingestion — async bulk (`POST /api/v1/documents/bulk`)
-
-```
-User uploads files[] + selects domain
-        │
-        ▼
-[Rate Limiter + MIME Type Check — same as sync]
-        │
-        ▼
-For each file:
-  ┌─────────────────────────────────────────┐
-  │  Register job in IngestionJobStore      │  state: PENDING
-  │  jobId = UUID.randomUUID()              │
-  └─────────────────────────────────────────┘
-        │
-        ▼
-  Dispatch to async thread pool (@Async)
-  Returns { jobId, filename, domain, status: "ACCEPTED" } immediately
-        │ (background)
-        ▼
-  Parse → Embed → Store in Pinecone  (same pipeline as sync)
-        │
-  ┌─────────────────────────────────────────┐
-  │  Update IngestionJobStore               │  state: COMPLETED or FAILED
-  └─────────────────────────────────────────┘
-
-Poll status: GET /api/v1/documents/status/{jobId}
-  → { jobId, filename, domain, state: PENDING|COMPLETED|FAILED, message }
-```
-
----
-
-### Chat / Query (`POST /api/v1/chat`)
-
-```
-User sends { conversationId, question }
-        │
-        ▼
-┌─────────────────────────────────┐
-│  RATE LIMITER  @RateLimiter     │  30 req/min (shared across all endpoints)
-│  RequestNotPermitted → 429      │
-└─────────────────────────────────┘
-        │
-        ▼
-┌──────────────────────────────────────────────────────────────┐
-│  CIRCUIT BREAKER + RETRY  @CircuitBreaker(llm) @Retry(llm)  │
-│  Retry: up to 3 attempts, 1s wait                            │
-│  Circuit Breaker: opens after 50% failures in 10 calls,      │
-│    stays open 30s, then half-open (3 probe calls)            │
-│  CB open or all retries exhausted → 503 Service Unavailable  │
-└──────────────────────────────────────────────────────────────┘
-        │
-        ▼
-1. DOMAIN ROUTING  [@Retry(llm) — up to 3 attempts, 1s wait]
-   gpt-4o-mini classifies the question → HR / PRODUCT / AI
-   All retries exhausted → fallback: PRODUCT  (domainFallback: true in response)
-        │
-        ▼
-2. LOAD CONVERSATION HISTORY
-   PostgreSQL: last 10 messages for the conversation
-        │
-        ▼
-3. CALL LLM  (agentic)
-   ChatAssistant receives the question + history
-   System prompt instructs it to call searchKnowledgeBase before answering
-        │
-        ▼
-4. LLM CALLS TOOL (zero or more times)
-   searchKnowledgeBase(query, domain)  [@Retry(pinecone) — up to 3 attempts, 2s wait]
-     ├── Embed query → OpenAI text-embedding-3-small
-     ├── Search Pinecone namespace (cosine similarity, top 5)
-     ├── Filter: keep chunks with score ≥ 0.7
-     └── Return formatted excerpts + source filenames to LLM
-   LLM may call this multiple times with refined queries
-   All retries exhausted → "Knowledge base temporarily unavailable" returned to LLM
-        │
-        ▼
-5. LLM GENERATES ANSWER
-   Grounded in tool results, cites source documents in the answer text
-        │
-        ▼
-6. SAVE TO MEMORY
-   PostgreSQL INSERT: user message + assistant answer
-        │
-        ▼
-7. RETURN RESPONSE
-   { answer, confidence: "TOOL_BASED", sources: [], routedDomain, domainFallback }
-```
-
----
-
-## Setup
-
-### 1. Pinecone Index
-
-Create an index at [app.pinecone.io](https://app.pinecone.io):
-- **Dimension:** `1536`
-- **Metric:** `cosine`
-- **Name:** `knowledge-base`
-
-### 2. PostgreSQL
-
-Create a database named `ai-assisstant`. Hibernate auto-creates the `chat_messages` table on first run.
-
-### 3. Environment Variables
-
-Create a `.env` file in the project root (loaded automatically by spring-dotenv):
-
-```env
-# Required
-OPENAI_KEY=sk-...
-PINECONE_API_KEY=pcsk_...
-PINECONE_INDEX_NAME=knowledge-base
-DB_USER=postgres
-DB_PASSWORD=your_password
-
-# Optional — LLM tuning (these have defaults, no need to set unless overriding)
-OPENAI_CHAT_MODEL=gpt-4o-mini
-OPENAI_TEMPERATURE=0.3
-OPENAI_MAX_TOKENS=1024
-OPENAI_EMBEDDING_MODEL=text-embedding-3-small
-
-# Optional — rate limiting (default: 30 req/min across all endpoints)
-RATE_LIMIT_RPM=30
-```
-
-`API_KEY` is optional. Set it to enable API key authentication on all endpoints. Leave it unset to disable auth (useful in dev).
-
-### 4. Run
-
-```bash
-./mvnw spring-boot:run
-```
-
-Server starts at **http://localhost:8080**
-
----
+1. Validate request and apply rate limiting.
+2. Optional semantic cache lookup (Redis).
+3. Ambiguity detection and optional query rewrite.
+4. Domain routing (`HR`, `PRODUCT`, `AI`).
+5. Build conversation context from PostgreSQL memory.
+6. Retrieve supporting chunks from Pinecone + PostgreSQL FTS (RRF merge).
+7. Generate answer with citations.
+8. Run grounding check and map confidence.
+9. Persist conversation messages and update semantic cache.
 
 ## API Endpoints
 
 | Method | Path | Description |
 |---|---|---|
-| `POST` | `/api/v1/chat` | Ask a question (domain auto-detected) |
-| `POST` | `/api/v1/documents` | Upload a single document (sync) |
-| `POST` | `/api/v1/documents/bulk` | Upload multiple documents (async, returns jobIds) |
-| `GET` | `/api/v1/documents/status/{jobId}` | Poll the status of an async ingestion job |
+| `POST` | `/api/v1/chat` | Ask a question |
+| `POST` | `/api/v1/documents` | Ingest one document (sync) |
+| `POST` | `/api/v1/documents/bulk` | Ingest multiple documents (async) |
+| `GET` | `/api/v1/documents/status/{jobId}` | Check async ingestion job |
 | `GET` | `/api/v1/domains` | List available domains |
+| `GET` | `/actuator/health` | Integration health summary |
 
-Supported file formats: `.pdf`, `.txt` — max 10 MB per file. The `Content-Type` header must be `application/pdf` or `text/plain`; anything else is rejected with 415.
+### Chat Request
 
-**Chat request:**
 ```json
 {
   "conversationId": "550e8400-e29b-41d4-a716-446655440000",
-  "question": "What is our PTO policy?"
+  "question": "What are HR roles and responsibilities?"
 }
 ```
 
-`conversationId` must be a valid UUID or omitted (a new one is generated automatically).
+`conversationId` must be a UUID when provided.
 
-**Chat response:**
+### Chat Response
+
 ```json
 {
-  "answer": "Employees are entitled to 20 days of PTO per year... (source: hr-policy.pdf)",
-  "confidence": "TOOL_BASED",
-  "sources": [],
+  "answer": "HR is responsible for recruitment, onboarding, payroll and compliance...",
+  "confidence": "HIGH",
+  "sources": ["HR-Roles-and-Responsibilities-PDF.pdf"],
   "routedDomain": "HR",
   "domainFallback": false
 }
 ```
 
-`domainFallback: true` means the LLM-based domain classifier failed after retries and the request was routed to PRODUCT as a default.
+`domainFallback = true` means no strong domain match was found and default routing was used.
 
-**Bulk ingest response** (one entry per file):
-```json
-[
-  {
-    "jobId": "3f6a1b2c-84d0-4e7f-9012-abcdef012345",
-    "filename": "hr-policy.pdf",
-    "domain": "HR",
-    "status": "ACCEPTED",
-    "message": "Queued for async ingestion. Poll /api/v1/documents/status/3f6a1b2c-84d0-4e7f-9012-abcdef012345"
-  }
-]
+## Setup
+
+### 1) Prerequisites
+
+- Java 21
+- PostgreSQL
+- Pinecone index (`1536` dimensions, metric `cosine`)
+- Redis Stack / Redis Cloud with RediSearch support
+
+### 2) Environment
+
+Create `.env` in the project root:
+
+```env
+SPRING_PROFILES_ACTIVE=dev
+
+DB_USER=postgres
+DB_PASSWORD=your_password
+
+OPENAI_KEY=sk-...
+OPENAI_CHAT_MODEL=gpt-4o-mini
+OPENAI_EMBEDDING_MODEL=text-embedding-3-small
+
+PINECONE_API_KEY=pcsk_...
+PINECONE_INDEX_NAME=knowledge-base
+
+REDIS_HOST=...
+REDIS_PORT=...
+REDIS_USER=default
+REDIS_PASSWORD=...
+REDIS_SSL=false
+
+API_KEY=
+RATE_LIMIT_RPM=30
 ```
 
-**Ingestion status response:**
-```json
-{
-  "jobId": "3f6a1b2c-84d0-4e7f-9012-abcdef012345",
-  "filename": "hr-policy.pdf",
-  "domain": "HR",
-  "state": "COMPLETED",
-  "message": "Ingested successfully"
-}
+### 3) Run
+
+```bash
+./mvnw spring-boot:run
 ```
 
-Possible `state` values: `PENDING`, `COMPLETED`, `FAILED`.
+App starts on `http://localhost:8080`.
 
----
+## Prompt Management
 
-## Health Monitoring
+Prompt files are loaded from resources:
 
-`GET /actuator/health` reports the status of both external dependencies:
+- `src/main/resources/prompts/` for default/prod
+- `src/main/resources/prompts-dev/` for `dev` profile
 
-```json
-{
-  "status": "UP",
-  "components": {
-    "openai": {
-      "status": "UP"
-    },
-    "pinecone": {
-      "status": "UP",
-      "details": { "namespaces": 3, "backend": "pinecone" }
-    }
-  }
-}
+Key prompt files:
+
+- `chat-system.st`
+- `chat-user.st`
+- `domain-router.st`
+- `query-rewriter.st`
+
+## Health and Observability
+
+`/actuator/health` includes:
+
+- `db` (PostgreSQL connectivity)
+- `openai` (embedding API check)
+- `pinecone` (backend/store status)
+
+Request/response timing is logged by filters, and chat pipeline events include routing, retrieval, grounding, and cache hit/miss signals.
+
+## Build and Test
+
+```bash
+./mvnw test
+./mvnw package -DskipTests
 ```
 
-- **openai** — makes a lightweight embedding call (`text-embedding-3-small`) to verify the API key and network are reachable. Result is cached for 30 seconds to avoid billing on every poll.
-- **pinecone** — checks whether each domain namespace is backed by a live `PineconeEmbeddingStore` or the in-memory fallback. No network call; purely type-based. Possible statuses: `UP` (all Pinecone), `DOWN` (all fallback), `UNKNOWN` (mixed).
-
----
-
-## Deploy
+## Deployment
 
 ### Docker
 
 ```bash
 ./mvnw package -DskipTests
-
 docker build -t ragbase .
 docker run -p 8080:8080 --env-file .env ragbase
 ```
 
-`Dockerfile`:
-```dockerfile
-FROM eclipse-temurin:21-jre
-COPY target/ai-assistant-0.0.1-SNAPSHOT.jar app.jar
-ENTRYPOINT ["java", "-jar", "/app.jar"]
-```
-
-### Manual (any server with Java 21)
+### Jar
 
 ```bash
 ./mvnw package -DskipTests
-java -jar target/ai-assistant-0.0.1-SNAPSHOT.jar
+java -jar target/*.jar
 ```
