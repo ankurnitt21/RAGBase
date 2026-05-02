@@ -2,9 +2,13 @@ package com.enterprise.aiassistant.service;
 
 import com.enterprise.aiassistant.dto.Domain;
 import com.enterprise.aiassistant.entity.DocumentChunk;
+import com.enterprise.aiassistant.entity.DocumentEntity;
 import com.enterprise.aiassistant.exception.DocumentIngestionException;
 import com.enterprise.aiassistant.repository.DocumentChunkRepository;
+import com.enterprise.aiassistant.repository.DocumentRepository;
+import com.enterprise.aiassistant.repository.VectorSearchRepository;
 import dev.langchain4j.data.document.Document;
+import dev.langchain4j.data.embedding.Embedding;
 import io.github.resilience4j.retry.annotation.Retry;
 import dev.langchain4j.data.document.DocumentSplitter;
 import dev.langchain4j.data.document.Metadata;
@@ -13,7 +17,6 @@ import dev.langchain4j.data.document.splitter.DocumentSplitters;
 import dev.langchain4j.data.segment.TextSegment;
 import dev.langchain4j.model.embedding.EmbeddingModel;
 import dev.langchain4j.store.embedding.EmbeddingStore;
-import dev.langchain4j.store.embedding.EmbeddingStoreIngestor;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.scheduling.annotation.Async;
@@ -49,15 +52,21 @@ public class IngestionService {
     private final EmbeddingModel embeddingModel;
     private final IngestionJobStore jobStore;
     private final DocumentChunkRepository documentChunkRepository;
+    private final DocumentRepository documentRepository;
+    private final VectorSearchRepository vectorSearchRepository;
 
     public IngestionService(Map<Domain, EmbeddingStore<TextSegment>> domainStores,
                             EmbeddingModel embeddingModel,
                             IngestionJobStore jobStore,
-                            DocumentChunkRepository documentChunkRepository) {
+                            DocumentChunkRepository documentChunkRepository,
+                            DocumentRepository documentRepository,
+                            VectorSearchRepository vectorSearchRepository) {
         this.domainStores = domainStores;
         this.embeddingModel = embeddingModel;
         this.jobStore = jobStore;
         this.documentChunkRepository = documentChunkRepository;
+        this.documentRepository = documentRepository;
+        this.vectorSearchRepository = vectorSearchRepository;
     }
 
     @Retry(name = "pinecone", fallbackMethod = "ingestFallback")
@@ -119,22 +128,49 @@ public class IngestionService {
         List<TextSegment> chunks = splitter.split(document);
         log.info("'{}' split into {} chunks for domain [{}]", filename, chunks.size(), domain);
 
-        // Vector store (Pinecone) — for semantic search
-        EmbeddingStoreIngestor.builder()
-                .documentSplitter(splitter)
-                .embeddingModel(embeddingModel)
-                .embeddingStore(domainStores.get(domain))
-                .build()
-                .ingest(document);
+        // Create parent document record
+        DocumentEntity docEntity = documentRepository.save(
+                new DocumentEntity(filename != null ? filename : "unknown", domain.name(),
+                        filename != null ? filename : "unknown", "1.0"));
+        Long documentId = docEntity.getId();
 
-        // PostgreSQL — for keyword (BM25-style) search via full-text index
-        List<DocumentChunk> dbChunks = chunks.stream()
-                .map(chunk -> new DocumentChunk(domain.name(), chunk.text(), filename != null ? filename : "unknown"))
-                .toList();
-        documentChunkRepository.saveAll(dbChunks);
+        // Generate embeddings for all chunks (single batch call)
+        List<Embedding> embeddings = embeddingModel.embedAll(chunks).content();
 
-        log.info("Successfully ingested '{}' ({} chunks) into domain [{}] — Pinecone + PostgreSQL",
-                 filename, chunks.size(), domain);
+        // PostgreSQL — store text + embeddings for hybrid search (HNSW + BM25 FTS)
+        List<DocumentChunk> dbChunks = new java.util.ArrayList<>();
+        for (int i = 0; i < chunks.size(); i++) {
+            dbChunks.add(new DocumentChunk(documentId, domain.name(), chunks.get(i).text(),
+                    filename != null ? filename : "unknown", i));
+        }
+        List<DocumentChunk> saved = documentChunkRepository.saveAll(dbChunks);
+
+        // Batch-update the embedding column via pgvector
+        List<Long> ids = saved.stream().map(DocumentChunk::getId).toList();
+        List<float[]> embeddingArrays = embeddings.stream().map(Embedding::vector).toList();
+        vectorSearchRepository.batchUpdateEmbeddings(ids, embeddingArrays);
+
+        // Pinecone — redundant store for data safety (non-blocking; failure is tolerated)
+        try {
+            EmbeddingStore<TextSegment> store = domainStores.get(domain);
+            for (int i = 0; i < chunks.size(); i++) {
+                // Enrich Pinecone metadata: document_id, chunk_index, created_at, tags, author, version
+                Metadata enrichedMeta = chunks.get(i).metadata().copy();
+                enrichedMeta.put("document_id", String.valueOf(documentId));
+                enrichedMeta.put("chunk_index", String.valueOf(i));
+                enrichedMeta.put("created_at", Instant.now().toString());
+                enrichedMeta.put("tags", domain.name().toLowerCase());
+                enrichedMeta.put("author", "system");
+                enrichedMeta.put("version", "1.0");
+                TextSegment enriched = TextSegment.from(chunks.get(i).text(), enrichedMeta);
+                store.add(embeddings.get(i), enriched);
+            }
+        } catch (Exception e) {
+            log.warn("Pinecone sync failed for '{}' — PostgreSQL has the data: {}", filename, e.getMessage());
+        }
+
+        log.info("Ingested '{}' ({} chunks, docId={}) into domain [{}] — PostgreSQL (text+embeddings) + Pinecone",
+                 filename, chunks.size(), documentId, domain);
     }
 
     private Map<String, String> buildMetadata(String filename, Domain domain) {

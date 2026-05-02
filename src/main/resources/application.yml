@@ -11,7 +11,7 @@ spring:
       max-file-size: 10MB
       max-request-size: 10MB
   datasource:
-    url: jdbc:postgresql://localhost:5432/ai-assisstant
+    url: ${DB_URL:jdbc:postgresql://localhost:5434/ragbase_db}
     username: ${DB_USER}
     password: ${DB_PASSWORD}
     driver-class-name: org.postgresql.Driver
@@ -23,13 +23,23 @@ spring:
       hibernate:
         dialect: org.hibernate.dialect.PostgreSQLDialect
 
-# OpenAI — gpt-4o-mini (chat + routing) and text-embedding-3-small (embeddings)
+# Groq — llama-3.3-70b-versatile (chat LLM via OpenAI-compatible API)
+# Groq has no embedding model — OpenAI is used for embeddings separately.
+groq:
+  api-key: ${GROQ_API_KEY}
+  base-url: https://api.groq.com/openai/v1
+  chat-model: ${GROQ_CHAT_MODEL:llama-3.3-70b-versatile}
+  fast-model: ${GROQ_FAST_MODEL:llama-3.1-8b-instant}
+  chat-temperature: 0.0
+  chat-max-tokens: 4096
+
+# OpenAI — text-embedding-3-small (embeddings only)
+# dimensions=384 matches the existing Pinecone knowledge-base index.
+# text-embedding-3-small supports dimension reduction natively.
 openai:
-  api-key: ${OPENAI_KEY}
-  chat-model: ${OPENAI_CHAT_MODEL}
-  chat-temperature: ${OPENAI_TEMPERATURE}
-  chat-max-tokens: ${OPENAI_MAX_TOKENS}
-  embedding-model: ${OPENAI_EMBEDDING_MODEL}
+  api-key: ${OPENAI_API_KEY}
+  embedding-model: ${OPENAI_EMBEDDING_MODEL:text-embedding-3-small}
+  embedding-dimensions: ${OPENAI_EMBEDDING_DIMENSIONS:384}
 
 # Pinecone Vector Store
 pinecone:
@@ -44,41 +54,34 @@ app:
     chat-system: classpath:prompts/chat-system.st
     domain-router: classpath:prompts/domain-router.st
     query-rewriter: classpath:prompts/query-rewriter.st
+    ambiguity-check: classpath:prompts/ambiguity-check.st
   self-consistency:
-    # Set to true to run the LLM N times and select the most consistent answer.
-    # Multiplies cost and latency by samples. Leave false unless answer accuracy
-    # is critical and latency budget allows it.
     enabled: ${SELF_CONSISTENCY_ENABLED:false}
     samples: ${SELF_CONSISTENCY_SAMPLES:3}
   memory:
-    # Token budget for verbatim recent messages (newest-first, always included).
-    # ~1500 tokens ≈ 8–10 typical chat turns. Raise for richer context, lower to save cost.
     recent-token-budget: ${MEMORY_RECENT_TOKENS:1500}
-    # Token budget for semantically relevant older messages picked by vector search.
-    # These are injected between the summary/nothing and the recent block.
-    semantic-token-budget: ${MEMORY_SEMANTIC_TOKENS:800}
-    # If older messages (outside the recent window) exceed this many tokens,
-    # the LLM summarises them instead of running semantic search.
-    # ~1500 tokens ≈ 6–8 turns of older history before summarisation kicks in.
-    summary-threshold-tokens: ${MEMORY_SUMMARY_THRESHOLD:1500}
-    # Maximum tokens the generated summary itself may occupy in the context.
     summary-max-tokens: ${MEMORY_SUMMARY_MAX:400}
   semantic-cache:
-    # Set to false to disable and always run the full pipeline.
     enabled: ${SEMANTIC_CACHE_ENABLED:true}
-    # Cosine similarity threshold (0.0–1.0). Higher = stricter match required before
-    # returning a cached answer. 0.92 catches paraphrases while avoiding false positives.
     similarity-threshold: ${SEMANTIC_CACHE_THRESHOLD:0.92}
-    # Entry lifetime in hours. 0 = never expire (entries live until Redis eviction policy).
     ttl-hours: ${SEMANTIC_CACHE_TTL_HOURS:24}
   redis:
     host: ${REDIS_HOST}
     port: ${REDIS_PORT}
     user: ${REDIS_USER}
     password: ${REDIS_PASSWORD}
-    # Redis Cloud uses plain TCP on the assigned port by default.
-    # Set to true if your instance is configured with TLS.
     ssl: ${REDIS_SSL}
+
+# LangSmith tracing via OpenTelemetry OTLP
+langsmith:
+  api-key: ${LANGSMITH_API_KEY:}
+  endpoint: ${LANGSMITH_ENDPOINT:https://api.smith.langchain.com/otel/v1/traces}
+  project: ${LANGSMITH_PROJECT:rag-system}
+
+# RAGAS evaluation service
+ragas:
+  enabled: ${RAGAS_ENABLED:false}
+  service-url: ${RAGAS_SERVICE_URL:http://localhost:8100}
 
 # Actuator
 management:

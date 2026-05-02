@@ -1,0 +1,239 @@
+flowchart TD
+    A[POST /api/v1/chat] --> B[START: ChatService.chat]
+    A2[POST /api/v1/chat/stream] --> B2[START: ChatService.chatStream — SSE streaming]
+    B --> TIMER[startTime = System.currentTimeMillis]
+    B2 --> TIMER
+
+    %% ════════════════════════════════════════════════════════════════
+    %% STEP 1: domain_routing + embedding_generation (PARALLEL)
+    %% ════════════════════════════════════════════════════════════════
+    TIMER --> PAR_START[Step 1: Parallel launch — 4 virtual threads]
+    PAR_START --> S0_DOM[domain_routing — CompletableFuture]
+    PAR_START --> S0_EMB[embedding_generation — CompletableFuture]
+    PAR_START --> S0_HIST[historyFuture — CompletableFuture]
+    PAR_START --> S0_HAS[hasHistoryFuture — CompletableFuture]
+
+    S0_DOM --> DOM1[DomainRouterService.route — two-phase, 0 LLM calls]
+    DOM1 --> DOM_P1[Phase 1: Keyword match — instant, 0ms]
+    DOM_P1 --> DOM_K1[Count keyword hits per domain: HR vs PRODUCT vs AI]
+    DOM_K1 --> DOM_K2{Clear keyword winner? score >= 2 AND 2× runner-up}
+    DOM_K2 -->|Yes| DOM_DONE[Return domain — fallback=false]
+    DOM_K2 -->|No| DOM_P2[Phase 2: Embedding similarity — local ONNX ~5-10ms]
+    DOM_P2 --> DOM_E1[Cosine similarity vs pre-computed domain prototype embeddings]
+    DOM_E1 --> DOM_E3{Best similarity >= 0.3?}
+    DOM_E3 -->|Yes| DOM_E4[Return best domain — fallback=false]
+    DOM_E3 -->|No| DOM_E5[Fallback to PRODUCT — fallback=true]
+    DOM_DONE --> PAR_JOIN
+    DOM_E4 --> PAR_JOIN
+    DOM_E5 --> PAR_JOIN
+
+    S0_EMB --> EMB1[AllMiniLmL6V2EmbeddingModel — local ONNX, 384-dim]
+    EMB1 --> EMB2[Embedding computed ONCE — reused for cache + vector retrieval]
+    EMB2 --> PAR_JOIN
+
+    S0_HIST --> MEM1[MemoryService.getContext — token-based + incremental summary]
+    MEM1 --> MEM2{Messages fit in recentTokenBudget 1500?}
+    MEM2 -->|Yes| MEM9[Return full verbatim history]
+    MEM2 -->|No| MEM3[Split: recent block + older block]
+    MEM3 --> MEM5[Incremental LLM summarization of older messages]
+    MEM5 --> MEM9
+
+    S0_HAS --> HAS1[SQL EXISTS — fast ~5ms]
+    HAS1 --> PAR_JOIN
+
+    PAR_JOIN[Join all futures — routing + embedding + hasHistory ready]
+
+    %% ════════════════════════════════════════════════════════════════
+    %% STEP 2: ambiguity_detection (fast model — llama-3.1-8b-instant)
+    %% ════════════════════════════════════════════════════════════════
+    PAR_JOIN --> AMB_START[Step 2: Ambiguity detection — fast model]
+    AMB_START --> AMB_A{Phase A — heuristic: no history AND word_count < 4 AND no digits?}
+    AMB_A -->|Yes| Z2A[END: AWAITING_CLARIFICATION — 0 LLM calls]
+    AMB_A -->|No| AMB3[QueryAmbiguityDetector.isAmbiguous — heuristic rules]
+
+    AMB3 --> AMB4{Rule 1: word_count <= 4?}
+    AMB4 -->|Yes| AMB_HIT
+    AMB4 -->|No| AMB5{Rule 2: follow-up phrase?}
+    AMB5 -->|Yes| AMB_HIT
+    AMB5 -->|No| AMB6{Rule 3: anaphoric pronoun?}
+    AMB6 -->|Yes| AMB_HIT
+    AMB6 -->|No| AMB_MISS[heuristicAmbiguous = false]
+
+    AMB_HIT[heuristicAmbiguous = true] --> AMB7[Wait for historyFuture]
+    AMB7 --> AMB8[AmbiguityLlmChecker.check — llama-3.1-8b-instant, fast ~200ms]
+    AMB8 --> AMB9[Parse JSON: ambiguous flag + clarificationOptions]
+    AMB9 --> AMB10{LLM confirmed ambiguous?}
+    AMB10 -->|Yes| Z2B[END: AWAITING_CLARIFICATION — return options]
+    AMB10 -->|No| AMB_SKIP[Continue pipeline — cache SKIPPED for heuristic-flagged queries]
+
+    AMB_MISS --> S_CACHE
+    AMB_SKIP --> S_RET
+
+    %% ════════════════════════════════════════════════════════════════
+    %% STEP 3: semantic_cache_lookup (KNN=3, skipped if heuristic flagged)
+    %% ════════════════════════════════════════════════════════════════
+    S_CACHE[Step 3: semantic_cache_lookup — Redis HNSW, KNN=3]
+    S_CACHE --> CACHE1{semanticCacheEnabled AND NOT heuristicAmbiguous?}
+    CACHE1 -->|No| S_RET
+    CACHE1 -->|Yes| CACHE2[Redis KNN=3 with @domain TAG filter — cosine distance]
+    CACHE2 --> CACHE3{Best of 3 candidates: similarity >= 0.92?}
+    CACHE3 -->|Yes| CACHE4[Cache HIT — log to query_logs, finalize trace]
+    CACHE4 --> Z1[END: Return cached ChatResponse — 0 LLM calls]
+    CACHE3 -->|No| S_RET
+
+    CACHE2 -.->|Redis HASH fields| REDIS_META[embedding: FLOAT32 384-dim\nquestion: TEXT\nanswer_json: TEXT\ndomain: TAG\nconfidence: TAG\ncreated_at: TEXT\nmodel_version: TAG\nprompt_version: TAG]
+
+    %% ════════════════════════════════════════════════════════════════
+    %% STEP 4-7: Retrieval pipeline (vector → BM25 → RRF → rerank)
+    %% ════════════════════════════════════════════════════════════════
+    S_RET[Step 4-7: Retrieval pipeline]
+
+    S_RET --> RET_VEC[retrieval_vector — pgvector HNSW cosine, top 10]
+    RET_VEC --> RET_VEC1[Uses PRE-COMPUTED embedding — no duplicate embed!]
+    RET_VEC1 --> RET_VEC2[VectorSearchRepository.vectorSearch — domain-filtered]
+
+    S_RET --> RET_BM25[retrieval_bm25 — PostgreSQL FTS, top 10]
+    RET_BM25 --> RET_BM25_1[DocumentChunkRepository.fullTextSearch — ts_rank BM25]
+
+    RET_VEC2 --> RET_RRF[fusion_rrf — Reciprocal Rank Fusion, k=60]
+    RET_BM25_1 --> RET_RRF
+    RET_RRF --> RET_RRF1[score = Σ 1/RRF_K+rank — docs in both lists get summed]
+
+    RET_RRF1 --> RET_RERANK[reranking — top-5 by RRF score]
+    RET_RERANK --> RET_FORMAT[Format results + capture in ThreadLocal for grounding]
+
+    RET_FORMAT --> RET_CHECK{Any results?}
+    RET_CHECK -->|No| RET_NONE[Return: No relevant information found — LOW confidence]
+    RET_CHECK -->|Yes| S_LLM
+
+    RET_VEC2 -.->|Reads| DB_CHUNKS[document_chunks table\nid, document_id, domain, content,\nsource, chunk_index, embedding vector384]
+    RET_BM25_1 -.->|Reads| DB_CHUNKS
+
+    %% ════════════════════════════════════════════════════════════════
+    %% STEP 8: llm_generation (with child llm_call)
+    %% ════════════════════════════════════════════════════════════════
+    S_LLM[Step 8: llm_generation — parent span]
+    S_LLM --> LLM_PROMPT[Build prompt: question + history + retrieved docs]
+    LLM_PROMPT --> LLM_MODE{Self-consistency enabled?}
+
+    LLM_MODE -->|No — default| LLM_SINGLE[llm_call — Groq llama-3.3-70b-versatile, ~1.2s]
+    LLM_MODE -->|Yes| LLM_MULTI[N × llm_call_sample — independent LLM calls]
+    LLM_MULTI --> LLM_SELECT[llm_call_selector — pick best answer]
+    LLM_SINGLE --> S_GROUND
+    LLM_SELECT --> S_GROUND
+
+    LLM_SINGLE -.->|Streaming path| LLM_STREAM[StreamingChatLanguageModel — SSE tokens via SseEmitter]
+    LLM_STREAM -.->|onNext| SSE_TOKEN[Send token to client in real-time]
+    LLM_STREAM -.->|onComplete| SSE_DONE[Continue to grounding_check + response_build]
+
+    %% ════════════════════════════════════════════════════════════════
+    %% STEP 9: grounding_check
+    %% ════════════════════════════════════════════════════════════════
+    S_GROUND[Step 9: grounding_check]
+    S_GROUND --> GC1{retrievedContext blank?}
+    GC1 -->|Yes| GC_LOW[confidence = LOW]
+    GC1 -->|No| GC2[LLM check: SUPPORTED / PARTIAL / UNSUPPORTED]
+    GC2 --> GC3{Verdict?}
+    GC3 -->|SUPPORTED| GC_HIGH[confidence = HIGH]
+    GC3 -->|PARTIAL| GC_MED[confidence = MEDIUM]
+    GC3 -->|UNSUPPORTED| GC_LOW
+    GC_HIGH --> S_BUILD
+    GC_MED --> S_BUILD
+    GC_LOW --> S_BUILD
+
+    %% ════════════════════════════════════════════════════════════════
+    %% STEP 10: response_build
+    %% ════════════════════════════════════════════════════════════════
+    S_BUILD[Step 10: response_build]
+    S_BUILD --> BUILD1[Extract source filenames via regex]
+    BUILD1 --> BUILD2[MemoryService.saveMessage: user + assistant to PostgreSQL]
+    BUILD2 --> BUILD3{semanticCacheEnabled?}
+    BUILD3 -->|Yes| BUILD4[SemanticCacheService.put — Redis HASH + 24h TTL]
+    BUILD3 -->|No| BUILD5
+    BUILD4 --> BUILD5[Build ChatResponse]
+    BUILD5 --> LOG1[QueryLogRepository.save — query_logs table]
+    LOG1 --> TRACE_FIN[TracingService.finalizeRootSpan — LangSmith attributes]
+    TRACE_FIN --> FINAL[Return ChatResponse to caller]
+
+    LOG1 -.->|Writes to| DB_LOGS[query_logs table\nuser_query, domain, response, cache_hit,\nlatency_ms, llm_calls, llm_latency_ms,\ninput_tokens, output_tokens, cost_usd,\nragas_faithfulness, ragas_answer_relevancy,\nprompt_version]
+
+    %% ════════════════════════════════════════════════════════════════
+    %% STEP 11: ragas_evaluation (async, non-blocking)
+    %% ════════════════════════════════════════════════════════════════
+    TRACE_FIN --> RAGAS_START[Step 11: ragas_evaluation — async CompletableFuture]
+    RAGAS_START --> RAGAS1[RagasClient.evaluate — HTTP POST to Python service :8100]
+    RAGAS1 --> RAGAS2[Python FastAPI + RAGAS 0.2.10 + Groq LLM]
+    RAGAS2 --> RAGAS3[Metric: faithfulness — LLM-based, no embeddings needed]
+    RAGAS3 --> RAGAS4[Parse result: faithfulness score 0.0–1.0]
+    RAGAS4 --> RAGAS5[QueryLogRepository.findById → update ragas_faithfulness]
+    RAGAS5 --> RAGAS6[queryLogRepository.save — async DB update]
+
+    RAGAS2 -.->|Groq API| RAGAS_LLM[ChatOpenAI wrapper → Groq llama-3.3-70b\nLangchainLLMWrapper for RAGAS compatibility]
+    RAGAS2 -.->|Dataset| RAGAS_DATA[question, answer, contexts\nNo ground_truth → faithfulness only]
+
+    %% ════════════════════════════════════════════════════════════════
+    %% OpenTelemetry → LangSmith trace structure
+    %% ════════════════════════════════════════════════════════════════
+    subgraph OTEL [LangSmith Trace Structure — OpenTelemetry OTLP]
+        T_ROOT[rag_pipeline — root span, langsmith.span.kind=chain]
+        T_ROOT --> T_DOM[domain_routing]
+        T_ROOT --> T_EMB[embedding_generation]
+        T_ROOT --> T_AMB[ambiguity_detection — only if heuristic triggered]
+        T_ROOT --> T_CACHE[semantic_cache_lookup]
+        T_ROOT --> T_RVEC[retrieval_vector]
+        T_ROOT --> T_RBM25[retrieval_bm25]
+        T_ROOT --> T_RFRF[fusion_rrf]
+        T_ROOT --> T_RERANK[reranking]
+        T_ROOT --> T_LLMGEN[llm_generation]
+        T_LLMGEN --> T_LLMCALL[llm_call — gen_ai.* attributes]
+        T_ROOT --> T_GND[grounding_check]
+        T_ROOT --> T_BLD[response_build]
+        T_ROOT --> T_RAGAS[ragas_evaluation — async]
+        T_ROOT -.->|Metadata| T_PMETA[prompt.chat-system.version=N\nprompt.query-rewriter.version=N\nprompt.ambiguity-check.version=N]
+    end
+
+    %% ════════════════════════════════════════════════════════════════
+    %% Prompt Management (DB-backed, versioned, dynamic)
+    %% ════════════════════════════════════════════════════════════════
+    subgraph PROMPTS [Prompt Management — DB-Backed Versioning]
+        PM_START[App Startup] --> PM_SEED{prompt_templates table empty?}
+        PM_SEED -->|Yes| PM_FILE[Seed v1 from classpath .st files — active=true]
+        PM_SEED -->|No| PM_LOAD[Load active prompts into ConcurrentHashMap cache]
+        PM_FILE --> PM_LOAD
+
+        PM_API[REST API: /api/v1/prompts] --> PM_CREATE[POST /:name — create new version inactive]
+        PM_API --> PM_ACTIVATE[PUT /:name/activate/:version — set active]
+        PM_API --> PM_REFRESH[POST /refresh — hot-reload from DB, 0 downtime]
+        PM_API --> PM_LIST[GET /:name — list all versions]
+        PM_API --> PM_ACTIVE[GET /active — current active versions]
+
+        PM_ACTIVATE --> PM_DEACT[Deactivate all versions of name]
+        PM_DEACT --> PM_SET[Set target version active=true]
+        PM_SET --> PM_CACHE[Update in-memory cache]
+
+        PM_DB[(prompt_templates table\nid, name, version, content,\nactive, description,\ncreated_at, updated_at\nUNIQUE name,version)]
+        PM_LOAD -.->|Reads| PM_DB
+        PM_CREATE -.->|Writes| PM_DB
+    end
+
+    %% ════════════════════════════════════════════════════════════════
+    %% Document Ingestion flow
+    %% ════════════════════════════════════════════════════════════════
+    subgraph Ingestion [Document Ingestion Flow]
+        ING1[POST /api/v1/documents] --> ING2[IngestionService.ingest]
+        ING2 --> ING3[Parse: PDF via PDFBox or plain text]
+        ING3 --> ING4[Split: recursive 300 chars / 100 overlap]
+        ING4 --> ING5[DocumentEntity record → documents table]
+        ING5 --> ING6[Embed all chunks: AllMiniLmL6V2 ONNX — 384-dim batch]
+        ING6 --> ING7[Save DocumentChunks to PostgreSQL]
+        ING7 --> ING8[Batch-update pgvector embeddings via JDBC]
+        ING8 --> ING9[Pinecone sync — enriched metadata per vector]
+        ING9 -.->|Metadata| PC_META[text, source, domain,\ndocument_id, chunk_index]
+    end
+
+    %% ════════════════════════════════════════════════════════════════
+    %% POST /api/v1/chat/clarify
+    %% ════════════════════════════════════════════════════════════════
+    AA[POST /api/v1/chat/clarify] --> CLAR1[ClarifyRequest: conversationId + chosenQuery]
+    CLAR1 --> CLAR2[Build new ChatRequest with chosenQuery]
+    CLAR2 --> B

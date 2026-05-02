@@ -29,7 +29,7 @@ class AiAssistantApplicationTests {
 
     @Test
     void chatResponseRecordIncludesRoutedDomain() {
-        ChatResponse res = new ChatResponse("answer", "HIGH", List.of("doc.pdf"), "HR", false);
+        ChatResponse res = new ChatResponse("answer", "HIGH", List.of("doc.pdf"), "HR", false, "COMPLETED", List.of());
         assertEquals("answer", res.answer());
         assertEquals("HIGH", res.confidence());
         assertEquals(List.of("doc.pdf"), res.sources());

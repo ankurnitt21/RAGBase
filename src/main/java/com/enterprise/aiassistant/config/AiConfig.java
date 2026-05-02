@@ -12,6 +12,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Primary;
 import org.springframework.core.io.Resource;
 import org.springframework.core.io.ResourceLoader;
 import org.springframework.scheduling.annotation.EnableAsync;
@@ -19,11 +20,14 @@ import org.springframework.scheduling.annotation.EnableAsync;
 import com.enterprise.aiassistant.dto.Domain;
 import com.enterprise.aiassistant.service.ChatAssistant;
 import com.enterprise.aiassistant.service.KnowledgeBaseTools;
+
 import dev.langchain4j.data.segment.TextSegment;
 import dev.langchain4j.model.chat.ChatLanguageModel;
+import dev.langchain4j.model.chat.StreamingChatLanguageModel;
 import dev.langchain4j.model.embedding.EmbeddingModel;
+import dev.langchain4j.model.embedding.onnx.allminilml6v2.AllMiniLmL6V2EmbeddingModel;
 import dev.langchain4j.model.openai.OpenAiChatModel;
-import dev.langchain4j.model.openai.OpenAiEmbeddingModel;
+import dev.langchain4j.model.openai.OpenAiStreamingChatModel;
 import dev.langchain4j.service.AiServices;
 import dev.langchain4j.store.embedding.EmbeddingStore;
 import dev.langchain4j.store.embedding.inmemory.InMemoryEmbeddingStore;
@@ -47,20 +51,26 @@ public class AiConfig {
     @Value("${pinecone.index-name}")
     private String pineconeIndexName;
 
-    @Value("${openai.api-key}")
-    private String openAiApiKey;
+    // Groq — chat LLM via OpenAI-compatible API
+    @Value("${groq.api-key}")
+    private String groqApiKey;
 
-    @Value("${openai.chat-model}")
+    @Value("${groq.base-url}")
+    private String groqBaseUrl;
+
+    @Value("${groq.chat-model}")
     private String chatModelName;
 
-    @Value("${openai.chat-temperature}")
+    @Value("${groq.chat-temperature}")
     private double chatTemperature;
 
-    @Value("${openai.chat-max-tokens}")
+    @Value("${groq.chat-max-tokens}")
     private int chatMaxTokens;
 
-    @Value("${openai.embedding-model}")
-    private String embeddingModelName;
+    @Value("${groq.fast-model}")
+    private String fastModelName;
+
+    // OpenAI — no longer needed for embeddings (using local ONNX model)
 
     @Value("${app.prompts.chat-system}")
     private String chatSystemPromptPath;
@@ -72,9 +82,35 @@ public class AiConfig {
     }
 
     @Bean
+    @Primary
     ChatLanguageModel chatLanguageModel() {
         return OpenAiChatModel.builder()
-                .apiKey(openAiApiKey)
+                .baseUrl(groqBaseUrl)
+                .apiKey(groqApiKey)
+                .modelName(chatModelName)
+                .temperature(chatTemperature)
+                .maxTokens(chatMaxTokens)
+                .build();
+    }
+
+    @Bean("fastChatModel")
+    ChatLanguageModel fastChatModel() {
+        log.info("Fast ambiguity model: {} (via Groq)", fastModelName);
+        return OpenAiChatModel.builder()
+                .baseUrl(groqBaseUrl)
+                .apiKey(groqApiKey)
+                .modelName(fastModelName)
+                .temperature(0.0)
+                .maxTokens(1024)
+                .build();
+    }
+
+    @Bean
+    StreamingChatLanguageModel streamingChatLanguageModel() {
+        log.info("Streaming chat model: {} (via Groq)", chatModelName);
+        return OpenAiStreamingChatModel.builder()
+                .baseUrl(groqBaseUrl)
+                .apiKey(groqApiKey)
                 .modelName(chatModelName)
                 .temperature(chatTemperature)
                 .maxTokens(chatMaxTokens)
@@ -94,10 +130,8 @@ public class AiConfig {
 
     @Bean
     EmbeddingModel embeddingModel() {
-        return OpenAiEmbeddingModel.builder()
-                .apiKey(openAiApiKey)
-                .modelName(embeddingModelName)
-                .build();
+        log.info("Using local ONNX embedding model: all-MiniLM-L6-v2 (384-dim)");
+        return new AllMiniLmL6V2EmbeddingModel();
     }
 
     @Bean

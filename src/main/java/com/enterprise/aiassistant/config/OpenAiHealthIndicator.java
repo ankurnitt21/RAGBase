@@ -6,10 +6,9 @@ import org.springframework.boot.actuate.health.HealthIndicator;
 import org.springframework.stereotype.Component;
 
 /**
- * Actuator health check for OpenAI. Makes a lightweight embedding call
- * to verify the API key and network are reachable. Result is cached for
- * 30 seconds (configured in application.yml) to avoid unnecessary billing.
- * Reported at GET /actuator/health under the "openai" component key.
+ * Actuator health check for the embedding model. Makes a lightweight embedding
+ * call to verify the model is loaded and working. Reported at GET /actuator/health
+ * under the "openai" component key.
  */
 @Component("openai")
 public class OpenAiHealthIndicator implements HealthIndicator {

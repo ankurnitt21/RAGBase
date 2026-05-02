@@ -39,3 +39,7 @@ CLAUDE.md
 LANGCHAIN_COMPONENTS.md
 PRODUCTION_ROADMAP.md
 WAREHOUSE_PROJECT.md
+
+### Python ###
+__pycache__/
+*.pyc

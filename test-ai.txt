@@ -1,0 +1,19 @@
+AI and Machine Learning Guide
+
+What is RAG (Retrieval Augmented Generation)?
+RAG is a technique that enhances LLM responses by retrieving relevant documents from an external knowledge base before generating an answer. The process involves: 1) Converting the user query into an embedding vector, 2) Searching a vector database for similar document chunks, 3) Passing the retrieved context along with the query to the LLM, 4) The LLM generates a grounded answer based on the retrieved documents. RAG reduces hallucinations and allows the model to access up-to-date information.
+
+Vector Embeddings:
+Embeddings are dense numerical representations of text in high-dimensional space. Similar texts have embeddings that are close together (high cosine similarity). Popular embedding models include OpenAI text-embedding-3-small (384 or 1536 dimensions), Cohere embed-v3, and open-source models like E5 and BGE. Embeddings are stored in vector databases like Pinecone, pgvector, Weaviate, or Chroma for efficient similarity search.
+
+HNSW (Hierarchical Navigable Small World):
+HNSW is an approximate nearest neighbor (ANN) algorithm used for efficient vector search. It builds a multi-layer graph where each layer is a navigable small world graph. The top layers have fewer nodes for fast coarse search, while bottom layers have all nodes for precise results. Key parameters: M (graph connectivity, typically 16), ef_construction (build-time search width, typically 200), ef_search (query-time search width). HNSW provides O(log n) query time with high recall.
+
+BM25 and Full-Text Search:
+BM25 is a probabilistic ranking function used in information retrieval. It scores documents based on term frequency (TF), inverse document frequency (IDF), and document length normalization. PostgreSQL implements BM25-style ranking through ts_rank with tsvector/tsquery. Combining BM25 keyword search with vector semantic search (hybrid search) typically yields better retrieval quality than either alone.
+
+Reciprocal Rank Fusion (RRF):
+RRF is a simple yet effective method for merging results from multiple retrieval systems. The formula is: score(d) = sum(1/(k + rank_i)) where k is typically 60 and rank_i is the rank of document d in retrieval system i. Documents appearing in both vector and keyword results get higher fused scores, naturally boosting precision.
+
+LangChain4j:
+LangChain4j is a Java framework for building LLM-powered applications. It provides abstractions for chat models, embedding models, vector stores, document loaders, text splitters, and agent tools. It supports OpenAI, Anthropic, Ollama, and other LLM providers through a unified API.
