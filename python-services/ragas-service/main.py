@@ -37,51 +37,37 @@ def health():
 @app.post("/evaluate", response_model=EvaluationResponse)
 def evaluate(req: EvaluationRequest):
     try:
-        from datasets import Dataset
-        from ragas import evaluate as ragas_evaluate
-        from ragas.metrics import (
-            faithfulness,
-            context_precision,
-            context_recall,
-        )
         from langchain_openai import ChatOpenAI
-        from ragas.llms import LangchainLLMWrapper
 
-        # Use Groq as LLM via OpenAI-compatible API
         llm = ChatOpenAI(
             model=GROQ_MODEL,
             openai_api_key=GROQ_API_KEY,
             openai_api_base=GROQ_BASE_URL,
             temperature=0,
         )
-        ragas_llm = LangchainLLMWrapper(llm)
 
-        data = {
-            "question": [req.question],
-            "answer": [req.answer],
-            "contexts": [req.contexts],
-        }
+        # Manual faithfulness: check if each claim in the answer is supported by contexts
+        context_str = "\n".join(req.contexts)
+        faithfulness_prompt = (
+            "Given the following context and answer, evaluate faithfulness.\n\n"
+            f"Context:\n{context_str}\n\n"
+            f"Answer:\n{req.answer}\n\n"
+            "Rate how faithful the answer is to the context on a scale of 0.0 to 1.0, "
+            "where 1.0 means every claim is fully supported by the context and 0.0 means "
+            "no claims are supported.\n"
+            "Respond with ONLY a decimal number between 0.0 and 1.0, nothing else."
+        )
 
-        # faithfulness doesn't require embeddings; answer_relevancy does so we skip it
-        metrics = [faithfulness]
+        logger.info("Running faithfulness evaluation via LLM")
+        result = llm.invoke(faithfulness_prompt)
+        raw = result.content.strip()
 
-        if req.ground_truth:
-            data["ground_truth"] = [req.ground_truth]
-            metrics.extend([context_precision, context_recall])
-
-        dataset = Dataset.from_dict(data)
-
-        logger.info("Running RAGAS evaluation with %d metrics", len(metrics))
-        result = ragas_evaluate(dataset=dataset, metrics=metrics, llm=ragas_llm)
-
-        df = result.to_pandas()
-        row = df.iloc[0]
+        faithfulness_score = _safe_float(raw)
+        if faithfulness_score is not None:
+            faithfulness_score = max(0.0, min(1.0, faithfulness_score))
 
         response = EvaluationResponse(
-            answer_relevancy=_safe_float(row.get("answer_relevancy")),
-            faithfulness=_safe_float(row.get("faithfulness")),
-            context_precision=_safe_float(row.get("context_precision")),
-            context_recall=_safe_float(row.get("context_recall")),
+            faithfulness=faithfulness_score,
         )
 
         logger.info("RAGAS result: %s", response.model_dump())

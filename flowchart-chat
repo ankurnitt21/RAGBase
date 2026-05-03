@@ -5,6 +5,16 @@ flowchart TD
     B2 --> TIMER
 
     %% ════════════════════════════════════════════════════════════════
+    %% GUARD 0: prompt_injection — BEFORE pipeline starts
+    %% ════════════════════════════════════════════════════════════════
+    TIMER --> GUARD0{Guard 0: Prompt Injection Check — Python sidecar :8200}
+    GUARD0 --> GUARD0_CALL[GuardrailsClient.detectPromptInjection]
+    GUARD0_CALL --> GUARD0_DET{is_injection? — regex + heuristic + optional LLM-judge}
+    GUARD0_DET -->|Yes| GUARD0_BLOCK[BLOCKED: Return 'flagged by security system' — no pipeline runs]
+    GUARD0_DET -->|No| PAR_START
+    GUARD0_BLOCK --> Z_BLOCKED[END: status=BLOCKED, confidence=BLOCKED]
+
+    %% ════════════════════════════════════════════════════════════════
     %% STEP 1: domain_routing + embedding_generation (PARALLEL)
     %% ════════════════════════════════════════════════════════════════
     TIMER --> PAR_START[Step 1: Parallel launch — 4 virtual threads]
@@ -104,7 +114,17 @@ flowchart TD
 
     RET_FORMAT --> RET_CHECK{Any results?}
     RET_CHECK -->|No| RET_NONE[Return: No relevant information found — LOW confidence]
-    RET_CHECK -->|Yes| S_LLM
+    RET_CHECK -->|Yes| GUARD_INDIRECT
+
+    %% ════════════════════════════════════════════════════════════════
+    %% GUARD: indirect_injection — after retrieval, before LLM
+    %% ════════════════════════════════════════════════════════════════
+    GUARD_INDIRECT{Guard: Indirect Injection Check — scans retrieved context}
+    GUARD_INDIRECT --> GUARD_IND_CALL[GuardrailsClient.detectIndirectInjection]
+    GUARD_IND_CALL --> GUARD_IND_DET{contains_injection? — embedded commands in documents}
+    GUARD_IND_DET -->|Yes| GUARD_IND_BLOCK[BLOCKED: Retrieved documents contain injected instructions]
+    GUARD_IND_BLOCK --> Z_BLOCKED
+    GUARD_IND_DET -->|No| S_LLM
 
     RET_VEC2 -.->|Reads| DB_CHUNKS[document_chunks table\nid, document_id, domain, content,\nsource, chunk_index, embedding vector384]
     RET_BM25_1 -.->|Reads| DB_CHUNKS
@@ -119,38 +139,45 @@ flowchart TD
     LLM_MODE -->|No — default| LLM_SINGLE[llm_call — Groq llama-3.3-70b-versatile, ~1.2s]
     LLM_MODE -->|Yes| LLM_MULTI[N × llm_call_sample — independent LLM calls]
     LLM_MULTI --> LLM_SELECT[llm_call_selector — pick best answer]
-    LLM_SINGLE --> S_GROUND
-    LLM_SELECT --> S_GROUND
+    LLM_SINGLE --> GUARD_EXFIL
+    LLM_SELECT --> GUARD_EXFIL
+
+    %% ════════════════════════════════════════════════════════════════
+    %% GUARD: data_exfiltration — after LLM response, before grounding
+    %% ════════════════════════════════════════════════════════════════
+    GUARD_EXFIL{Guard: Data Exfiltration Check — scans LLM response}
+    GUARD_EXFIL --> GUARD_EXF_CALL[GuardrailsClient.checkDataExfiltration]
+    GUARD_EXF_CALL --> GUARD_EXF_DET{safe? — PII, secrets, encoded data check}
+    GUARD_EXF_DET -->|No| GUARD_EXF_BLOCK[BLOCKED: Response contains sensitive data]
+    GUARD_EXF_BLOCK --> Z_BLOCKED
+    GUARD_EXF_DET -->|Yes| S_BUILD
 
     LLM_SINGLE -.->|Streaming path| LLM_STREAM[StreamingChatLanguageModel — SSE tokens via SseEmitter]
     LLM_STREAM -.->|onNext| SSE_TOKEN[Send token to client in real-time]
-    LLM_STREAM -.->|onComplete| SSE_DONE[Continue to grounding_check + response_build]
+    LLM_STREAM -.->|onComplete| SSE_DONE[Continue to guards + response_build + async grounding]
 
     %% ════════════════════════════════════════════════════════════════
-    %% STEP 9: grounding_check
+    %% STEP 9+10: response_build (confidence defaults to MEDIUM, grounding is async)
     %% ════════════════════════════════════════════════════════════════
-    S_GROUND[Step 9: grounding_check]
-    S_GROUND --> GC1{retrievedContext blank?}
-    GC1 -->|Yes| GC_LOW[confidence = LOW]
-    GC1 -->|No| GC2[LLM check: SUPPORTED / PARTIAL / UNSUPPORTED]
-    GC2 --> GC3{Verdict?}
-    GC3 -->|SUPPORTED| GC_HIGH[confidence = HIGH]
-    GC3 -->|PARTIAL| GC_MED[confidence = MEDIUM]
-    GC3 -->|UNSUPPORTED| GC_LOW
-    GC_HIGH --> S_BUILD
-    GC_MED --> S_BUILD
-    GC_LOW --> S_BUILD
-
-    %% ════════════════════════════════════════════════════════════════
-    %% STEP 10: response_build
-    %% ════════════════════════════════════════════════════════════════
-    S_BUILD[Step 10: response_build]
+    S_BUILD[Step 9+10: response_build — confidence defaults to MEDIUM]
     S_BUILD --> BUILD1[Extract source filenames via regex]
     BUILD1 --> BUILD2[MemoryService.saveMessage: user + assistant to PostgreSQL]
     BUILD2 --> BUILD3{semanticCacheEnabled?}
-    BUILD3 -->|Yes| BUILD4[SemanticCacheService.put — Redis HASH + 24h TTL]
+    BUILD3 -->|Yes| GUARD_CACHE
     BUILD3 -->|No| BUILD5
-    BUILD4 --> BUILD5[Build ChatResponse]
+
+    %% ════════════════════════════════════════════════════════════════
+    %% GUARD: cache_poison — before writing to semantic cache
+    %% ════════════════════════════════════════════════════════════════
+    GUARD_CACHE{Guard: Cache Poison Check — validates before cache write}
+    GUARD_CACHE --> GUARD_CP_CALL[GuardrailsClient.checkCachePoison]
+    GUARD_CP_CALL --> GUARD_CP_DET{safe_to_cache? — length ratio, contradictions, prompt leakage}
+    GUARD_CP_DET -->|Yes| BUILD4[SemanticCacheService.put — Redis HASH + 24h TTL]
+    GUARD_CP_DET -->|No| BUILD_SKIP_CACHE[Skip cache write — log risk_level + issues]
+    BUILD4 --> BUILD5
+    BUILD_SKIP_CACHE --> BUILD5
+
+    BUILD5[Build ChatResponse]
     BUILD5 --> LOG1[QueryLogRepository.save — query_logs table]
     LOG1 --> TRACE_FIN[TracingService.finalizeRootSpan — LangSmith attributes]
     TRACE_FIN --> FINAL[Return ChatResponse to caller]
@@ -158,9 +185,21 @@ flowchart TD
     LOG1 -.->|Writes to| DB_LOGS[query_logs table\nuser_query, domain, response, cache_hit,\nlatency_ms, llm_calls, llm_latency_ms,\ninput_tokens, output_tokens, cost_usd,\nragas_faithfulness, ragas_answer_relevancy,\nprompt_version]
 
     %% ════════════════════════════════════════════════════════════════
-    %% STEP 11: ragas_evaluation (async, non-blocking)
+    %% STEP 11: grounding_check (async, non-blocking — logs result)
     %% ════════════════════════════════════════════════════════════════
-    TRACE_FIN --> RAGAS_START[Step 11: ragas_evaluation — async CompletableFuture]
+    TRACE_FIN --> GROUND_ASYNC[Step 11: grounding_check — async CompletableFuture]
+    GROUND_ASYNC --> GC1{retrievedContext blank?}
+    GC1 -->|Yes| GC_LOG_LOW[Log: confidence = LOW]
+    GC1 -->|No| GC2[LLM check: SUPPORTED / PARTIAL / UNSUPPORTED]
+    GC2 --> GC3{Verdict?}
+    GC3 -->|SUPPORTED| GC_LOG_HIGH[Log: confidence = HIGH]
+    GC3 -->|PARTIAL| GC_LOG_MED[Log: confidence = MEDIUM]
+    GC3 -->|UNSUPPORTED| GC_LOG_LOW
+
+    %% ════════════════════════════════════════════════════════════════
+    %% STEP 12: ragas_evaluation (async, non-blocking)
+    %% ════════════════════════════════════════════════════════════════
+    TRACE_FIN --> RAGAS_START[Step 12: ragas_evaluation — async CompletableFuture]
     RAGAS_START --> RAGAS1[RagasClient.evaluate — HTTP POST to Python service :8100]
     RAGAS1 --> RAGAS2[Python FastAPI + RAGAS 0.2.10 + Groq LLM]
     RAGAS2 --> RAGAS3[Metric: faithfulness — LLM-based, no embeddings needed]
@@ -176,6 +215,7 @@ flowchart TD
     %% ════════════════════════════════════════════════════════════════
     subgraph OTEL [LangSmith Trace Structure — OpenTelemetry OTLP]
         T_ROOT[rag_pipeline — root span, langsmith.span.kind=chain]
+        T_ROOT --> T_GUARD0[prompt_injection — Guard 0, before pipeline]
         T_ROOT --> T_DOM[domain_routing]
         T_ROOT --> T_EMB[embedding_generation]
         T_ROOT --> T_AMB[ambiguity_detection — only if heuristic triggered]
@@ -184,10 +224,13 @@ flowchart TD
         T_ROOT --> T_RBM25[retrieval_bm25]
         T_ROOT --> T_RFRF[fusion_rrf]
         T_ROOT --> T_RERANK[reranking]
+        T_ROOT --> T_GUARD_IND[indirect_injection — after retrieval]
         T_ROOT --> T_LLMGEN[llm_generation]
         T_LLMGEN --> T_LLMCALL[llm_call — gen_ai.* attributes]
-        T_ROOT --> T_GND[grounding_check]
+        T_ROOT --> T_GUARD_EXF[data_exfiltration — after LLM]
         T_ROOT --> T_BLD[response_build]
+        T_ROOT --> T_GUARD_CP[cache_poison — before cache write]
+        T_ROOT --> T_GND[grounding_check — async]
         T_ROOT --> T_RAGAS[ragas_evaluation — async]
         T_ROOT -.->|Metadata| T_PMETA[prompt.chat-system.version=N\nprompt.query-rewriter.version=N\nprompt.ambiguity-check.version=N]
     end

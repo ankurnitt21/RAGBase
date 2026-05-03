@@ -80,8 +80,14 @@ langsmith:
 
 # RAGAS evaluation service
 ragas:
-  enabled: ${RAGAS_ENABLED:false}
+  enabled: ${RAGAS_ENABLED:true}
   service-url: ${RAGAS_SERVICE_URL:http://localhost:8100}
+
+# Guardrails AI service
+guardrails:
+  enabled: ${GUARDRAILS_ENABLED:true}
+  service-url: ${GUARDRAILS_SERVICE_URL:http://localhost:8200}
+  timeout-ms: ${GUARDRAILS_TIMEOUT_MS:3000}
 
 # Actuator
 management:

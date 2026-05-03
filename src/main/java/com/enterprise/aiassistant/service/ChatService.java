@@ -90,6 +90,7 @@ public class ChatService {
     private final TracingService tracingService;
     private final RagasClient ragasClient;
     private final PromptService promptService;
+    private final GuardrailsClient guardrailsClient;
 
     public ChatService(KnowledgeBaseTools knowledgeBaseTools,
                        MemoryService memoryService,
@@ -105,7 +106,8 @@ public class ChatService {
                        @Qualifier("pipelineExecutor") Executor pipelineExecutor,
                        TracingService tracingService,
                        RagasClient ragasClient,
-                       PromptService promptService) {
+                       PromptService promptService,
+                       GuardrailsClient guardrailsClient) {
         this.knowledgeBaseTools = knowledgeBaseTools;
         this.memoryService = memoryService;
         this.domainRouter = domainRouter;
@@ -121,6 +123,7 @@ public class ChatService {
         this.tracingService = tracingService;
         this.ragasClient = ragasClient;
         this.promptService = promptService;
+        this.guardrailsClient = guardrailsClient;
     }
 
     @CircuitBreaker(name = "llm", fallbackMethod = "chatFallback")
@@ -134,6 +137,17 @@ public class ChatService {
                 : UUID.randomUUID().toString();
 
         String originalQuestion = request.question();
+
+        // ── Guard 0: Prompt Injection Detection (FIRST — before any processing) ──
+        GuardrailsClient.InjectionResult injectionCheck = guardrailsClient.detectPromptInjection(originalQuestion);
+        if (injectionCheck.isInjection()) {
+            log.warn("[{}] GUARDRAIL BLOCKED: Prompt injection detected — type={}, confidence={}, reason={}",
+                    conversationId, injectionCheck.attackType(), injectionCheck.confidence(), injectionCheck.reason());
+            return new ChatResponse(
+                    "I'm unable to process this request. Your input was flagged by our security system.",
+                    "BLOCKED", List.of(), "SECURITY", false, "BLOCKED", List.of());
+        }
+
         Span rootSpan = tracingService.startRootSpan(originalQuestion);
         metrics.promptVersions = promptService.getActiveVersions();
 
@@ -253,6 +267,20 @@ public class ChatService {
             String history = historyFuture.join();
             log.info("Question routed to domain: {} (fallback={})", routing.domain(), routing.fallback());
 
+            // ── Guard: Indirect Injection Detection (retrieved context) ──────
+            GuardrailsClient.IndirectInjectionResult indirectCheck =
+                    guardrailsClient.detectIndirectInjection(retrievedContext, originalQuestion);
+            if (indirectCheck.containsInjection()) {
+                log.warn("[{}] GUARDRAIL: Indirect injection in retrieved context — type={}, confidence={}, reason={}",
+                        conversationId, indirectCheck.attackType(), indirectCheck.confidence(), indirectCheck.reason());
+                metrics.totalLatencyMs = System.currentTimeMillis() - startTime;
+                tracingService.finalizeRootSpan(rootSpan, metrics, routing.domain().name(), "BLOCKED", routing.fallback());
+                return new ChatResponse(
+                        "I detected potentially manipulated content in the knowledge base results. "
+                        + "For your safety, I cannot provide an answer based on this context. Please try rephrasing your question.",
+                        "BLOCKED", List.of(), routing.domain().name(), routing.fallback(), "BLOCKED", List.of());
+            }
+
             // ── Step 8: llm_generation (with child llm_call) ────────────────
             Span llmGenSpan = tracingService.startChildSpan("llm_generation", rootSpan, "chain", originalQuestion);
             String answer;
@@ -266,24 +294,40 @@ public class ChatService {
                 llmGenSpan.end();
             }
 
-            // ── Step 9: grounding_check ─────────────────────────────────────
-            String confidence = tracingService.traceStepWithLatency("grounding_check", rootSpan,
-                    "chain", "{\"question\":\"" + originalQuestion + "\"}",
-                    latency -> metrics.groundingLatencyMs = latency,
-                    () -> groundingCheck(originalQuestion, answer, retrievedContext, metrics));
+            // ── Guard: Data Exfiltration Protection (response output) ────────
+            GuardrailsClient.DataExfiltrationResult exfilCheck =
+                    guardrailsClient.checkDataExfiltration(answer, originalQuestion);
+            if (!exfilCheck.safe()) {
+                log.warn("[{}] GUARDRAIL: Data exfiltration blocked — pii={}, secrets={}, issues={}",
+                        conversationId, exfilCheck.containsPii(), exfilCheck.containsSecrets(), exfilCheck.issues());
+                metrics.totalLatencyMs = System.currentTimeMillis() - startTime;
+                tracingService.finalizeRootSpan(rootSpan, metrics, routing.domain().name(), "BLOCKED", routing.fallback());
+                return new ChatResponse(
+                        "I generated a response but it was blocked by our security system because it "
+                        + "contained sensitive information that should not be disclosed. Please refine your question.",
+                        "BLOCKED", List.of(), routing.domain().name(), routing.fallback(), "BLOCKED", List.of());
+            }
 
-            // ── Step 10: response_build ─────────────────────────────────────
+            // ── Step 9+10: response_build (grounding runs async — label only, no decision) ──
             List<String> sources = extractSources(retrievedContext);
             ChatResponse response = tracingService.traceStep("response_build", rootSpan,
-                    "{\"confidence\":\"" + confidence + "\",\"sources\":" + sources.size() + "}",
+                    "{\"sources\":" + sources.size() + "}",
                     () -> {
                         memoryService.saveMessage(conversationId, "user", originalQuestion);
                         memoryService.saveMessage(conversationId, "assistant", answer);
-                        ChatResponse resp = new ChatResponse(answer, confidence, sources,
+                        ChatResponse resp = new ChatResponse(answer, "MEDIUM", sources,
                                 routing.domain().name(), routing.fallback(), "COMPLETED", List.of());
                         if (semanticCacheEnabled && questionEmbedding != null) {
-                            int pv = promptService.getActiveVersion("chat-system");
-                            semanticCache.put(questionEmbedding, originalQuestion, routing.domain().name(), resp, pv);
+                            // ── Guard: Cache Poisoning Prevention ─────────────
+                            GuardrailsClient.CachePoisonResult cacheCheck =
+                                    guardrailsClient.checkCachePoison(originalQuestion, answer, "MEDIUM", routing.domain().name());
+                            if (cacheCheck.safeToCache()) {
+                                int pv = promptService.getActiveVersion("chat-system");
+                                semanticCache.put(questionEmbedding, originalQuestion, routing.domain().name(), resp, pv);
+                            } else {
+                                log.warn("[{}] GUARDRAIL: Cache poisoning prevented — issues={}",
+                                        conversationId, cacheCheck.issues());
+                            }
                         }
                         return resp;
                     });
@@ -291,35 +335,90 @@ public class ChatService {
             metrics.totalLatencyMs = System.currentTimeMillis() - startTime;
 
             QueryLog savedLog = logQueryWithMetrics(originalQuestion, routing.domain().name(), answer,
-                    metrics, confidence, routing.fallback());
+                    metrics, "MEDIUM", routing.fallback());
             tracingService.finalizeRootSpan(rootSpan, metrics, routing.domain().name(),
-                    confidence, routing.fallback());
+                    "MEDIUM", routing.fallback());
 
-            // ── Step 11: ragas_evaluation (async, non-blocking) ─────────────
+            // ── Step 11: grounding_check (async — label only, updates DB after) ──
             final String evalQuestion = originalQuestion;
             final String evalAnswer = answer;
             final String evalContext = retrievedContext;
             final Long savedLogId = savedLog != null ? savedLog.getId() : null;
+            final String domainName = routing.domain().name();
+            final boolean fallbackFlag = routing.fallback();
+
             CompletableFuture.runAsync(() -> {
                 try {
-                    tracingService.traceStepVoid("ragas_evaluation", rootSpan,
-                            "{\"question\":\"" + evalQuestion + "\"}", () -> {
+                    Span groundSpan = tracingService.startChildSpan("grounding_check", rootSpan, "chain",
+                            "{\"question\":\"" + evalQuestion + "\",\"answer_length\":" + evalAnswer.length() + "}");
+                    try {
+                        long gStart = System.currentTimeMillis();
+                        String confidence = groundingCheck(evalQuestion, evalAnswer, evalContext, metrics);
+                        long gLatency = System.currentTimeMillis() - gStart;
+                        metrics.groundingLatencyMs = gLatency;
+                        groundSpan.setAttribute("output.value", "{\"confidence\":\"" + confidence + "\"}");
+                        groundSpan.setAttribute("latency_ms", gLatency);
+                        log.info("Grounding async done: confidence={}, latency={}ms", confidence, gLatency);
+                    } catch (Exception e) {
+                        groundSpan.setStatus(StatusCode.ERROR, e.getMessage());
+                        log.warn("Async grounding check failed: {}", e.getMessage());
+                    } finally {
+                        groundSpan.end();
+                    }
+                } catch (Exception e) {
+                    log.warn("Grounding span creation failed: {}", e.getMessage());
+                }
+            }, pipelineExecutor);
+
+            // ── Step 12: ragas_evaluation (async, non-blocking) ─────────────
+            CompletableFuture.runAsync(() -> {
+                try {
+                    String ragasInput = String.format(
+                            "{\"question\":\"%s\",\"answer\":\"%s\",\"contexts_count\":%d}",
+                            TracingService.truncate(evalQuestion),
+                            TracingService.truncate(evalAnswer).replace("\"", "'"),
+                            evalContext != null ? 1 : 0);
+                    Span ragasSpan = tracingService.startChildSpan("ragas_evaluation", rootSpan, "chain", ragasInput);
+                    try {
+                        long rStart = System.currentTimeMillis();
                         RagasClient.RagasResult ragas = ragasClient.evaluate(
                                 evalQuestion, evalAnswer,
                                 evalContext != null ? List.of(evalContext) : List.of(), null);
-                        if (ragas != null && savedLogId != null) {
-                            queryLogRepository.findById(savedLogId).ifPresent(ql -> {
-                                ql.setRagasAnswerRelevancy(ragas.answerRelevancy());
-                                ql.setRagasFaithfulness(ragas.faithfulness());
-                                ql.setRagasContextPrecision(ragas.contextPrecision());
-                                ql.setRagasContextRecall(ragas.contextRecall());
-                                queryLogRepository.save(ql);
-                                log.info("RAGAS scores saved: faithfulness={}", ragas.faithfulness());
-                            });
+                        long rLatency = System.currentTimeMillis() - rStart;
+                        ragasSpan.setAttribute("latency_ms", rLatency);
+
+                        if (ragas != null) {
+                            String ragasOutput = String.format(
+                                    "{\"faithfulness\":%.4f,\"answer_relevancy\":%.4f,\"context_precision\":%.4f,\"context_recall\":%.4f,\"latency_ms\":%d}",
+                                    ragas.faithfulness() != null ? ragas.faithfulness() : 0.0,
+                                    ragas.answerRelevancy() != null ? ragas.answerRelevancy() : 0.0,
+                                    ragas.contextPrecision() != null ? ragas.contextPrecision() : 0.0,
+                                    ragas.contextRecall() != null ? ragas.contextRecall() : 0.0,
+                                    rLatency);
+                            ragasSpan.setAttribute("output.value", ragasOutput);
+
+                            if (savedLogId != null) {
+                                queryLogRepository.findById(savedLogId).ifPresent(ql -> {
+                                    ql.setRagasAnswerRelevancy(ragas.answerRelevancy());
+                                    ql.setRagasFaithfulness(ragas.faithfulness());
+                                    ql.setRagasContextPrecision(ragas.contextPrecision());
+                                    ql.setRagasContextRecall(ragas.contextRecall());
+                                    queryLogRepository.save(ql);
+                                    log.info("RAGAS scores saved: faithfulness={}", ragas.faithfulness());
+                                });
+                            }
+                        } else {
+                            ragasSpan.setAttribute("output.value", "{\"status\":\"disabled_or_failed\"}");
                         }
-                    });
+                    } catch (Exception e) {
+                        ragasSpan.setStatus(StatusCode.ERROR, e.getMessage());
+                        ragasSpan.setAttribute("output.value", "{\"error\":\"" + e.getMessage() + "\"}");
+                        log.warn("RAGAS evaluation failed: {}", e.getMessage());
+                    } finally {
+                        ragasSpan.end();
+                    }
                 } catch (Exception e) {
-                    log.warn("RAGAS evaluation failed: {}", e.getMessage());
+                    log.warn("RAGAS span creation failed: {}", e.getMessage());
                 }
             }, pipelineExecutor);
 
@@ -422,14 +521,13 @@ public class ChatService {
                                     int estOut = (int) Math.ceil(answer.length() / 4.0);
                                     metrics.recordLlmCall(estIn, estOut);
 
-                                    String confidence = groundingCheck(originalQuestion, answer, rCtx, metrics);
                                     List<String> sources = extractSources(rCtx);
 
                                     memoryService.saveMessage(conversationId, "user", originalQuestion);
                                     memoryService.saveMessage(conversationId, "assistant", answer);
 
                                     if (semanticCacheEnabled) {
-                                        ChatResponse resp = new ChatResponse(answer, confidence, sources,
+                                        ChatResponse resp = new ChatResponse(answer, "MEDIUM", sources,
                                                 domainName, fallback, "COMPLETED", List.of());
                                         int pv = promptService.getActiveVersion("chat-system");
                                         semanticCache.put(questionEmbedding, originalQuestion, domainName, resp, pv);
@@ -437,12 +535,22 @@ public class ChatService {
 
                                     metrics.totalLatencyMs = System.currentTimeMillis() - startTime;
                                     logQueryWithMetrics(originalQuestion, domainName, answer,
-                                            metrics, confidence, fallback);
+                                            metrics, "MEDIUM", fallback);
 
-                                    ChatResponse chatResp = new ChatResponse(answer, confidence, sources,
+                                    ChatResponse chatResp = new ChatResponse(answer, "MEDIUM", sources,
                                             domainName, fallback, "COMPLETED", List.of());
                                     emitter.send(SseEmitter.event().name("done").data(chatResp));
                                     emitter.complete();
+
+                                    // Async grounding check (label only — no decision)
+                                    CompletableFuture.runAsync(() -> {
+                                        try {
+                                            String conf = groundingCheck(originalQuestion, answer, rCtx, metrics);
+                                            log.info("Streaming grounding async done: confidence={}", conf);
+                                        } catch (Exception ex) {
+                                            log.warn("Streaming grounding failed: {}", ex.getMessage());
+                                        }
+                                    }, pipelineExecutor);
                                 } catch (Exception e) {
                                     try { emitter.completeWithError(e); } catch (Exception ignored) {}
                                 }
