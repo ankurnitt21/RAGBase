@@ -1,0 +1,18 @@
+Job Title,Level,Annual Salary (USD),Performance Bonus,Stock Options,Health Insurance,Dental,Vision,Annual Leave (days),Sick Leave (days),Maternity Leave (weeks),Paternity Leave (weeks),Remote Work Policy
+Junior Software Engineer,L1,75000,5%,0.05%,Full,Full,Full,15,10,16,4,Hybrid (3 days office)
+Software Engineer,L2,105000,8%,0.10%,Full,Full,Full,18,12,16,4,Hybrid (2 days office)
+Senior Software Engineer,L3,140000,12%,0.20%,Full,Full,Full,20,15,20,8,Flexible
+Staff Engineer,L4,175000,15%,0.35%,Full,Full,Full,22,15,24,12,Fully Remote eligible
+Principal Engineer,L5,215000,18%,0.60%,Full,Full,Full,25,15,24,12,Fully Remote eligible
+Engineering Manager,M3,195000,20%,0.50%,Full,Full,Full,22,15,24,12,Flexible
+Senior Engineering Manager,M4,235000,22%,0.80%,Full,Full,Full,25,15,24,12,Fully Remote eligible
+Director of Engineering,D5,285000,25%,1.20%,Full,Full,Full,25,15,24,12,Fully Remote eligible
+VP of Engineering,VP,350000,30%,2.00%,Full,Full,Full,Unlimited,15,24,12,Fully Remote eligible
+Junior Data Scientist,L1,80000,5%,0.05%,Full,Full,Full,15,10,16,4,Hybrid (3 days office)
+Data Scientist,L2,115000,8%,0.12%,Full,Full,Full,18,12,16,4,Hybrid (2 days office)
+Senior Data Scientist,L3,150000,12%,0.22%,Full,Full,Full,20,15,20,8,Flexible
+Product Manager,M2,130000,15%,0.25%,Full,Full,Full,20,12,16,4,Hybrid (2 days office)
+Senior Product Manager,M3,165000,18%,0.40%,Full,Full,Full,22,15,24,8,Flexible
+HR Business Partner,L2,90000,8%,0.08%,Full,Full,Full,18,12,16,4,Hybrid
+Contract Worker,C1,0,0%,0%,Not Covered,Not Covered,Not Covered,10,5,Not eligible,Not eligible,On-site only
+Part-Time Employee,P1,0,0%,0%,50% subsidized,Not Covered,Not Covered,12,7,90 days (pro-rata),Not eligible,On-site preferred

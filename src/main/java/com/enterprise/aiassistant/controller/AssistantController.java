@@ -54,7 +54,15 @@ import jakarta.validation.Valid;
 @Tag(name = "RAGBase", description = "RAG-based document Q&A with domain routing")
 public class AssistantController {
 
-    private static final Set<String> ALLOWED_CONTENT_TYPES = Set.of("application/pdf", "text/plain");
+    private static final Set<String> ALLOWED_CONTENT_TYPES = Set.of(
+            "application/pdf",
+            "text/plain",
+            "text/csv",
+            "application/csv",
+            "application/vnd.ms-excel",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    );
 
     private final ChatService chatService;
     private final IngestionService ingestionService;
@@ -93,7 +101,7 @@ public class AssistantController {
         return chatService.chat(chatRequest);
     }
 
-    @Operation(summary = "Ingest document (sync)", description = "Upload a single PDF or .txt file into a domain namespace. Blocks until done.")
+    @Operation(summary = "Ingest document (sync)", description = "Upload a single PDF, .txt, .csv, .xlsx, .xls, or .docx file into a domain namespace. Blocks until done.")
     @PostMapping(value = "/documents", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
     @RateLimiter(name = "api")
     public IngestionResponse ingestDocument(
@@ -143,7 +151,8 @@ public class AssistantController {
         String contentType = file.getContentType();
         if (contentType == null || !ALLOWED_CONTENT_TYPES.contains(contentType)) {
             throw new UnsupportedFileTypeException(
-                    "Unsupported file type: '" + contentType + "'. Allowed types: application/pdf, text/plain");
+                    "Unsupported file type: '" + contentType + "'. "
+                    + "Allowed types: PDF, plain text, CSV, Excel (.xlsx/.xls), Word (.docx)");
         }
     }
 }

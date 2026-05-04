@@ -24,7 +24,8 @@ It uses Groq (`llama-3.3-70b-versatile`) for chat, a fast model (`llama-3.1-8b-i
 - **Domain-scoped semantic cache** in Redis (HNSW KNN=3 + TAG filter) — skips the full pipeline on similar questions
 - **LangSmith tracing**: every span has `input.value`, `output.value`, `langsmith.span.kind`, `gen_ai.*`, and `prompt.*.version` attributes
 - **Rich metadata**: `documents` table (parent records), `document_chunks` with `document_id` + `chunk_index`, `query_logs` for observability
-- Sync and async document ingestion APIs
+- Sync and async document ingestion APIs with **multi-format support**: PDF, Word (`.docx`), Excel (`.xlsx`/`.xls`), CSV, and plain text
+- **Table-aware chunking**: structured content (tables) is converted to Markdown and chunked by rows with the header repeated in every chunk, enabling precise row-level retrieval
 - Resilience4j rate limiting, retry, circuit breaker
 
 ## Tech Stack
@@ -44,6 +45,7 @@ It uses Groq (`llama-3.3-70b-versatile`) for chat, a fast model (`llama-3.1-8b-i
 | Evaluation   | RAGAS 0.2.10 (Python FastAPI on port 8100, faithfulness metric)                                           |
 | Tracing      | OpenTelemetry SDK → LangSmith OTLP (`OtlpHttpSpanExporter`)                                               |
 | Resilience   | Resilience4j (rate limiter 30rpm, retry 3x, circuit breaker)                                              |
+| Parsing      | PDFBox + Tabula 1.0.5 (PDF text+tables), Apache POI 5.3 (Word/Excel), OpenCSV 5.9 (CSV)                  |
 | API Docs     | Swagger UI (`/swagger-ui.html`)                                                                           |
 
 ## Database Schema
@@ -630,6 +632,57 @@ Multi-domain (question spanned HR + PRODUCT):
   "clarificationOptions": []
 }
 ```
+
+## Document Ingestion — Supported Formats
+
+Documents are ingested via `POST /api/v1/documents` (sync) or `POST /api/v1/documents/bulk` (async). The `DocumentTextExtractor` service handles each format:
+
+| Format               | Extension(s)        | Library             | How Tables Are Handled                                      |
+| -------------------- | ------------------- | ------------------- | ----------------------------------------------------------- |
+| PDF                  | `.pdf`              | PDFBox + **Tabula** | Per-page: table bounding boxes detected → Markdown; surrounding text preserved via `PDFTextStripperByArea` in reading order; scanned PDFs rejected |
+| Word                 | `.docx`             | Apache POI XWPF     | Paragraphs + tables in document order; tables → Markdown    |
+| Excel                | `.xlsx`, `.xls`     | Apache POI          | Each sheet becomes a Markdown table with a `## SheetName` heading |
+| CSV                  | `.csv`              | OpenCSV             | All rows → Markdown table; header on row 1                  |
+| Plain text / Markdown | `.txt`, `.md`, etc. | raw UTF-8           | Split as-is with recursive splitter                         |
+
+### Table-Aware Chunking
+
+For tabular content (CSV rows, Excel sheets, DOCX tables), a **table-aware splitter** is used instead of the standard recursive character splitter:
+
+- The document is first divided into logical sections on blank lines.
+- Sections where ≥ 60% of lines start with `|` are treated as tables.
+- Tables are chunked by **10 data rows per chunk**, with the **header row repeated** at the top of every chunk.
+- This means a query for "salary of Senior Software Engineer" can retrieve the exact rows that contain that data, with the column headers available for context.
+- Non-tabular sections use the standard `DocumentSplitters.recursive(400, 100)`.
+
+### Example: Ingest a CSV
+
+```bash
+curl -X POST http://localhost:8080/api/v1/documents \
+  -F "file=@employees.csv;type=text/csv" \
+  -F "domain=HR"
+```
+
+### Example: Ingest an Excel file
+
+```bash
+curl -X POST http://localhost:8080/api/v1/documents \
+  -F "file=@product-pricing.xlsx;type=application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" \
+  -F "domain=PRODUCT"
+```
+
+### Accepted MIME Types
+
+| MIME Type                                                                 | Format |
+| ------------------------------------------------------------------------- | ------ |
+| `application/pdf`                                                         | PDF    |
+| `text/plain`                                                              | Text   |
+| `text/csv`, `application/csv`                                             | CSV    |
+| `application/vnd.ms-excel`                                                | XLS    |
+| `application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`       | XLSX   |
+| `application/vnd.openxmlformats-officedocument.wordprocessingml.document` | DOCX   |
+
+---
 
 ## Setup
 

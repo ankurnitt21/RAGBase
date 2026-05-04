@@ -146,6 +146,34 @@
             <version>${opentelemetry.version}</version>
         </dependency>
 
+        <!-- Apache POI: Word (.docx) + Excel (.xlsx / .xls) -->
+        <dependency>
+            <groupId>org.apache.poi</groupId>
+            <artifactId>poi-ooxml</artifactId>
+            <version>5.3.0</version>
+        </dependency>
+
+        <!-- Tabula-Java: table detection in PDF files (wraps PDFBox) -->
+        <dependency>
+            <groupId>technology.tabula</groupId>
+            <artifactId>tabula</artifactId>
+            <version>1.0.5</version>
+            <exclusions>
+                <!-- PDFBox already on classpath via langchain4j-document-parser-apache-pdfbox -->
+                <exclusion>
+                    <groupId>org.apache.pdfbox</groupId>
+                    <artifactId>pdfbox</artifactId>
+                </exclusion>
+            </exclusions>
+        </dependency>
+
+        <!-- OpenCSV: CSV parsing -->
+        <dependency>
+            <groupId>com.opencsv</groupId>
+            <artifactId>opencsv</artifactId>
+            <version>5.9</version>
+        </dependency>
+
         <!-- Test -->
         <dependency>
             <groupId>org.springframework.boot</groupId>

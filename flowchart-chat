@@ -282,11 +282,27 @@ flowchart TD
     %% â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
     %% Document Ingestion flow
     %% â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-    subgraph Ingestion [Document Ingestion Flow]
-        ING1[POST /api/v1/documents] --> ING2[IngestionService.ingest]
-        ING2 --> ING3[Parse: PDF via PDFBox or plain text]
-        ING3 --> ING4[Split: recursive 300 chars / 100 overlap]
-        ING4 --> ING5[DocumentEntity record â†’ documents table]
+    subgraph Ingestion [Document Ingestion Flow â€" Multi-Format Table-Aware]
+        ING1[POST /api/v1/documents] --> ING_MIME{MIME type check}
+        ING_MIME -->|Unsupported| ING_REJECT[400: UnsupportedFileTypeException]
+        ING_MIME -->|Accepted| ING2[IngestionService.ingest]
+        ING2 --> ING_EXT[DocumentTextExtractor â€" route by extension]
+        ING_EXT -->|.pdf| ING_PDF[PDFBox + Tabula per-page:\n1. SpreadsheetAlgo detects bordered tables\n2. BasicAlgo fallback for whitespace tables\n3. PDFTextStripperByArea for non-table regions\n4. Segments interleaved top-to-bottom: text then Markdown table\nReject scanned/image PDFs]
+        ING_EXT -->|.docx| ING_DOCX[Apache POI XWPF â€" paragraphs + tables in order\nTables â†' Markdown]
+        ING_EXT -->|.xlsx / .xls| ING_EXCEL[Apache POI â€" iterate sheets â†' rows â†' cells\nEach sheet â†' Markdown table with ## heading]
+        ING_EXT -->|.csv| ING_CSV[OpenCSV â€" rows â†' Markdown table\nHeader on row 1]
+        ING_EXT -->|.txt etc.| ING_TEXT[Raw UTF-8 fallback]
+        ING_PDF --> ING_SPLIT
+        ING_DOCX --> ING_SPLIT
+        ING_EXCEL --> ING_SPLIT
+        ING_CSV --> ING_SPLIT
+        ING_TEXT --> ING_SPLIT
+        ING_SPLIT[tableAwareSplit â€" section-level routing]
+        ING_SPLIT -->|Table sections\n>60% lines start with pipe| ING_TABLE_CHUNK[Table chunker:\n10 data rows per chunk\nHeader row repeated in every chunk]
+        ING_SPLIT -->|Text sections| ING_TEXT_CHUNK[DocumentSplitters.recursive\n400 chars / 100 overlap]
+        ING_TABLE_CHUNK --> ING5
+        ING_TEXT_CHUNK --> ING5
+        ING5[DocumentEntity record â†' documents table]
         ING5 --> ING6[Embed all chunks: AllMiniLmL6V2 ONNX â€” 384-dim batch]
         ING6 --> ING7[Save DocumentChunks to PostgreSQL]
         ING7 --> ING8[Batch-update pgvector embeddings via JDBC]
