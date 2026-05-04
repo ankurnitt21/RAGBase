@@ -1,18 +1,21 @@
 # RAGBase
 
 RAGBase is a Spring Boot enterprise knowledge assistant that ingests documents and answers questions with citations.
-It uses Groq (llama-3.3-70b-versatile) for chat, a fast model (llama-3.1-8b-instant) for ambiguity detection, local ONNX all-MiniLM-L6-v2 for embeddings, Pinecone for redundant vector storage, PostgreSQL + pgvector for hybrid retrieval (HNSW + BM25 + RRF), Redis Stack for domain-scoped semantic answer caching, RAGAS for automated answer evaluation, and LangSmith for end-to-end trace observability.
+It uses Groq (`llama-3.3-70b-versatile`) for chat, a fast model (`llama-3.1-8b-instant`) for domain routing / ambiguity detection / query rewriting, local ONNX `all-MiniLM-L6-v2` for embeddings, Pinecone for redundant vector storage, PostgreSQL + pgvector for hybrid retrieval (HNSW + BM25 + RRF), Redis Stack for domain-scoped semantic answer caching, RAGAS for automated answer evaluation, and LangSmith for end-to-end trace observability.
 
 ## Highlights
 
-- **Domain-aware Q&A** (`HR`, `PRODUCT`, `AI`) with two-phase routing: keyword match → embedding similarity (local ONNX, no LLM call)
+- **Multi-domain routing** (`HR`, `PRODUCT`, `AI`) — fast LLM (`llama-3.1-8b-instant`) classifies questions into 1–3 domains AND splits the question into per-domain sub-questions (e.g. "leave policy" part → HR, "pricing" part → PRODUCT)
 - **Parallel pipeline**: domain routing + embedding generation + history load all run concurrently on virtual threads
-- **Single embedding, zero duplication**: embedding computed once and reused for cache lookup, vector retrieval, and cache storage
+- **Per-domain parallel retrieval**: each detected domain gets its own vector + BM25 retrieval running concurrently, using the domain-specific sub-question for both embedding and BM25 search
+- **Per-domain LangSmith spans**: `retrieval_vector_HR`, `retrieval_bm25_HR`, `retrieval_vector_PRODUCT`, etc. — every span shows `domain`, `sub_question`, and `original_question` in its input
+- **Domain-specific sub-question embedding**: each domain re-embeds its own sub-question locally (ONNX, ~5ms) rather than reusing the original question embedding
+- **Cross-domain RRF merge**: after per-domain RRF, all chunks are deduplicated by content hash and re-ranked across domains in a single `fusion_rrf` step
 - **Hybrid retrieval**: PostgreSQL HNSW vector search + BM25 full-text search, merged via Reciprocal Rank Fusion (RRF, k=60)
-- **Split retrieval tracing**: `retrieval_vector` → `retrieval_bm25` → `fusion_rrf` → `reranking` — each step individually traced
-- **Ambiguity detection**: heuristic fast path + LLM confirmation using a small fast model (llama-3.1-8b-instant, ~200ms). Cache skipped if heuristic flagged
+- **Ambiguity detection**: heuristic fast path + LLM confirmation using the fast model (~200ms). Cache skipped if heuristic flagged
+- **Query rewriting**: fast model rewrites the question into a search-optimized form before retrieval
 - **DB-backed prompt management**: prompts stored in PostgreSQL with versioning, active flag, and dynamic hot-reload (no restart)
-- **Prompt version tracking**: version metadata flows through Postgres (query_logs), Redis (cache entries), and LangSmith traces
+- **Prompt version tracking**: version metadata flows through Postgres (`query_logs`), Redis (cache entries), and LangSmith traces
 - **LLM streaming**: `POST /api/v1/chat/stream` returns Server-Sent Events (SSE) with token-by-token streaming
 - **Guardrails AI** (Python sidecar on port 8200): 4-layer security — prompt injection detection (entry), indirect injection detection (post-retrieval), data exfiltration protection (post-LLM), cache poisoning prevention (pre-cache)
 - **Grounding confidence** (`HIGH`, `MEDIUM`, `LOW`) from an async post-answer verification step (non-blocking)
@@ -31,9 +34,9 @@ It uses Groq (llama-3.3-70b-versatile) for chat, a fast model (llama-3.1-8b-inst
 | Runtime      | Java 21+, Spring Boot 3.4.1                                                                               |
 | AI Framework | LangChain4j 0.36.2                                                                                        |
 | Chat LLM     | Groq `llama-3.3-70b-versatile` via OpenAI-compatible API                                                  |
-| Fast LLM     | Groq `llama-3.1-8b-instant` (ambiguity detection)                                                         |
+| Fast LLM     | Groq `llama-3.1-8b-instant` (domain routing, ambiguity detection, query rewriting)                        |
 | Streaming    | `OpenAiStreamingChatModel` → SSE via `SseEmitter`                                                         |
-| Embeddings   | Local ONNX `all-MiniLM-L6-v2` (384-dim, no API call)                                                      |
+| Embeddings   | Local ONNX `all-MiniLM-L6-v2` (384-dim, no API call) — re-embedded per domain sub-question                |
 | Vector DB    | Pinecone (cosine, namespaces per domain) — redundant store                                                |
 | Primary DB   | PostgreSQL 16 + pgvector (HNSW + BM25 FTS + metadata)                                                     |
 | Cache        | Redis Stack (RediSearch HNSW KNN=3, domain-scoped, TTL 24h)                                               |
@@ -109,62 +112,64 @@ Constraints: `UNIQUE(name, version)` — ensures exactly one row per prompt + ve
                                 ▼
 ┌──────────────────────────────────────────────────────────────────────────────┐
 │  🛡️ GUARD 0: PROMPT INJECTION DETECTION                                      │
-│  ┌─────────────┐    ┌─────────────────┐    ┌──────────────────┐              │
-│  │ Layer 1:    │───▶│ Layer 2:        │───▶│ Layer 3:         │              │
-│  │ Regex       │    │ Heuristic       │    │ LLM-as-Judge     │              │
-│  │ Patterns    │    │ Analysis        │    │ (borderline)     │              │
-│  └─────────────┘    └─────────────────┘    └──────────────────┘              │
-│  Detects: jailbreaks, role-play, instruction override, encoding attacks      │
-│  Decision: confidence ≥ 0.7 → BLOCK immediately                             │
+│  regex patterns → heuristic analysis → optional LLM-as-judge                 │
+│  Decision: confidence ≥ 0.7 → BLOCK immediately                              │
 └───────────────────────────────┬──────────────────────────────────────────────┘
                                 │ ALLOWED
                                 ▼
 ┌──────────────────────────────────────────────────────────────────────────────┐
 │  ⚡ PARALLEL EXECUTION (Virtual Threads)                                      │
-│  ┌──────────────────┐  ┌───────────────────┐  ┌─────────────────┐           │
-│  │ Domain Routing   │  │ Embedding Gen     │  │ Memory Load     │           │
-│  │ (keywords →      │  │ (ONNX MiniLM,    │  │ (conversation   │           │
-│  │  cosine sim)     │  │  computed ONCE)    │  │  history)       │           │
-│  └──────────────────┘  └───────────────────┘  └─────────────────┘           │
+│  ┌──────────────────────┐  ┌────────────────────┐  ┌───────────────────┐    │
+│  │ Domain Routing       │  │ Embedding Gen      │  │ Memory Load       │    │
+│  │ fast LLM classifies  │  │ ONNX MiniLM,       │  │ conversation      │    │
+│  │ domains + splits     │  │ question embedding  │  │ history           │    │
+│  │ question per domain  │  │ for cache lookup    │  │                   │    │
+│  └──────────────────────┘  └────────────────────┘  └───────────────────┘    │
+│                                                                               │
+│  Domain routing output (one line per domain from fast LLM):                  │
+│    HR,What leave benefits do employees get?                                   │
+│    PRODUCT,What is the AI product pricing?                                    │
 └───────────────────────────────┬──────────────────────────────────────────────┘
                                 │
                                 ▼
 ┌──────────────────────────────────────────────────────────────────────────────┐
-│  🔍 AMBIGUITY DETECTION → CACHE LOOKUP → HYBRID RETRIEVAL                    │
+│  🔍 AMBIGUITY DETECTION → CACHE LOOKUP → PARALLEL PER-DOMAIN RETRIEVAL      │
 │                                                                               │
-│  Ambiguity: heuristic + fast LLM (llama-3.1-8b-instant, ~200ms)             │
-│       │                                                                       │
-│       ▼                                                                       │
+│  Ambiguity: heuristic + fast LLM (~200ms) — returns clarification if needed  │
 │  Cache Lookup: Redis HNSW KNN=3, domain-scoped (skip if ambiguous)           │
 │       │ MISS                                                                  │
 │       ▼                                                                       │
-│  ┌────────────┐   ┌────────────┐   ┌───────────┐   ┌──────────────┐         │
-│  │ Vector     │──▶│ BM25       │──▶│ RRF       │──▶│ Reranking    │         │
-│  │ Search     │   │ FTS        │   │ Fusion    │   │ (top-5)      │         │
-│  │ (pgvector) │   │ (ts_rank)  │   │ (k=60)    │   │              │         │
-│  └────────────┘   └────────────┘   └───────────┘   └──────────────┘         │
+│  For each detected domain — runs IN PARALLEL:                                 │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────────────────┐   │
+│  │ Re-embed     │  │ Vector Search│  │ BM25 Search                      │   │
+│  │ sub-question │→ │ Pinecone +   │  │ PostgreSQL FTS                   │   │
+│  │ (ONNX ~5ms)  │  │ pgvector     │  │ using sub-question               │   │
+│  └──────────────┘  └──────────────┘  └──────────────────────────────────┘   │
+│         ↓ per domain RRF merge                                                │
+│  ┌────────────────────────────────────────────────────────────────┐          │
+│  │ Cross-domain RRF: deduplicate + re-rank all chunks (fusion_rrf)│          │
+│  └────────────────────────────────────────────────────────────────┘          │
+│         ↓ reranking (top-5)                                                   │
 └───────────────────────────────┬──────────────────────────────────────────────┘
                                 │
                                 ▼
 ┌──────────────────────────────────────────────────────────────────────────────┐
 │  🛡️ GUARD: INDIRECT INJECTION DETECTION                                      │
-│  Scans retrieved context for embedded attacks (hidden instructions,           │
-│  zero-width chars, base64-encoded payloads). Blocks if poisoned docs found.  │
+│  Scans retrieved context for embedded attacks. Blocks if poisoned docs found.│
 └───────────────────────────────┬──────────────────────────────────────────────┘
                                 │ ALLOWED
                                 ▼
 ┌──────────────────────────────────────────────────────────────────────────────┐
 │  🤖 LLM GENERATION                                                           │
 │  Groq llama-3.3-70b-versatile (~1.2s)                                        │
-│  Prompt = System + History + Retrieved Context + Question                    │
+│  Prompt = System + History + Merged Context (all domains) + Question         │
 └───────────────────────────────┬──────────────────────────────────────────────┘
                                 │
                                 ▼
 ┌──────────────────────────────────────────────────────────────────────────────┐
 │  🛡️ GUARD: DATA EXFILTRATION PROTECTION                                      │
-│  Scans LLM response for: PII (SSN, credit cards, emails, phone),             │
-│  secrets (API keys, AWS keys, JWTs, passwords), bulk data dumps.             │
-│  Decision: contains PII/secrets → BLOCK response                             │
+│  Scans LLM response for PII, secrets, bulk data dumps.                       │
+│  Decision: contains sensitive data → BLOCK response                          │
 └───────────────────────────────┬──────────────────────────────────────────────┘
                                 │ SAFE
                                 ▼
@@ -177,6 +182,7 @@ Constraints: `UNIQUE(name, version)` — ensures exactly one row per prompt + ve
                                 ▼
 ┌──────────────────────────────────────────────────────────────────────────────┐
 │  ✅ RETURN ChatResponse TO USER                                               │
+│  routedDomain: "HR,PRODUCT"  ← comma-separated all detected domains          │
 └───────────────────────────────┬──────────────────────────────────────────────┘
                                 │
                                 ▼ (async, non-blocking)
@@ -184,10 +190,10 @@ Constraints: `UNIQUE(name, version)` — ensures exactly one row per prompt + ve
 │  📊 POST-RESPONSE ASYNC TASKS (CompletableFuture on virtual threads)         │
 │  ┌───────────────────────────┐   ┌───────────────────────────────────┐       │
 │  │ Grounding Check           │   │ RAGAS Evaluation                  │       │
-│  │ LLM judges if answer is   │   │ Python service scores             │       │
-│  │ SUPPORTED/PARTIAL/         │   │ faithfulness (0.0-1.0)            │       │
-│  │ UNSUPPORTED by context    │   │ via Groq LLM                      │       │
-│  │ → HIGH/MEDIUM/LOW         │   │ → saves to query_logs             │       │
+│  │ LLM judges: SUPPORTED /   │   │ Python service scores             │       │
+│  │ PARTIAL / UNSUPPORTED     │   │ faithfulness (0.0–1.0)            │       │
+│  │ → HIGH/MEDIUM/LOW         │   │ via Groq LLM                      │       │
+│  │                           │   │ → saves to query_logs             │       │
 │  └───────────────────────────┘   └───────────────────────────────────┘       │
 └──────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -195,25 +201,39 @@ Constraints: `UNIQUE(name, version)` — ensures exactly one row per prompt + ve
 ## Architecture (Chat Pipeline)
 
 ```
-rag_pipeline (~1.5s)
- ├── [GUARD 0] prompt_injection  (Python guardrails sidecar — BLOCKS if injection detected)
- ├── domain_routing              (keyword match → embedding similarity, 0 LLM calls)
- ├── embedding_generation        (ONNX all-MiniLM-L6-v2, ~10ms — computed ONCE)
- ├── [ambiguity_detection]       (fast model llama-3.1-8b-instant, ~200ms — only if heuristic triggers)
- ├── semantic_cache_lookup       (Redis HNSW KNN=3, @domain filter — skipped if ambiguous)
- ├── retrieval_vector            (pgvector HNSW cosine, top-10 — uses pre-computed embedding)
- ├── retrieval_bm25              (PostgreSQL FTS ts_rank, top-10)
- ├── fusion_rrf                  (Reciprocal Rank Fusion, k=60)
- ├── reranking                   (top-5 by RRF score)
- ├── [GUARD] indirect_injection  (checks retrieved context for embedded attacks)
+rag_pipeline (~1.5–3s depending on domain count)
+ ├── [GUARD 0] prompt_injection       (Python guardrails sidecar — BLOCKS if injection detected)
+ ├── domain_routing                   (fast LLM llama-3.1-8b-instant — classifies domains + splits question)
+ ├── embedding_generation             (ONNX all-MiniLM-L6-v2, ~10ms — for cache lookup)
+ ├── [ambiguity_detection]            (fast model, ~200ms — only if heuristic triggers)
+ ├── semantic_cache_lookup            (Redis HNSW KNN=3, @domain filter — skipped if ambiguous)
+ ├── retrieval_vector_HR              (re-embed HR sub-question → pgvector HNSW, top-10)
+ ├── retrieval_bm25_HR                (BM25 PostgreSQL FTS using HR sub-question, top-10)
+ ├── retrieval_vector_PRODUCT         (re-embed PRODUCT sub-question → pgvector HNSW, top-10)
+ ├── retrieval_bm25_PRODUCT           (BM25 PostgreSQL FTS using PRODUCT sub-question, top-10)
+ ├── retrieval_vector_AI              (re-embed AI sub-question → pgvector HNSW, top-10)  ← only if AI detected
+ ├── retrieval_bm25_AI                (BM25 PostgreSQL FTS using AI sub-question, top-10) ← only if AI detected
+ ├── fusion_rrf                       (cross-domain dedup + RRF re-rank, k=60)
+ ├── reranking                        (top-5 by RRF score)
+ ├── [GUARD] indirect_injection       (checks retrieved context for embedded attacks)
  ├── llm_generation (~1.2s)
- │     └── llm_call              (Groq llama-3.3-70b-versatile)
- ├── [GUARD] data_exfiltration   (blocks PII/secrets leakage in LLM response)
- ├── response_build              (persist, cache, build ChatResponse)
- │     └── [GUARD] cache_poison  (validates response before semantic cache write)
- ├── grounding_check             (async — LLM: SUPPORTED/PARTIAL/UNSUPPORTED → HIGH/MEDIUM/LOW)
- └── ragas_evaluation            (async, non-blocking — Python RAGAS service)
+ │     └── llm_call                   (Groq llama-3.3-70b-versatile)
+ ├── [GUARD] data_exfiltration        (blocks PII/secrets leakage in LLM response)
+ ├── response_build                   (persist, cache, build ChatResponse)
+ │     └── [GUARD] cache_poison       (validates response before semantic cache write)
+ ├── grounding_check                  (async — LLM: SUPPORTED/PARTIAL/UNSUPPORTED → HIGH/MEDIUM/LOW)
+ └── ragas_evaluation                 (async, non-blocking — Python RAGAS service)
 ```
+
+### LangSmith Span Input/Output per Step
+
+| Span                          | Input                                       | Output                                                                                        |
+| ----------------------------- | ------------------------------------------- | --------------------------------------------------------------------------------------------- |
+| `domain_routing`              | original question                           | `DomainRoutingResult[domain=HR, domainQuestions={HR=sub-q1, PRODUCT=sub-q2}, fallback=false]` |
+| `retrieval_vector_HR`         | `{domain, sub_question, original_question}` | top-N vector results                                                                          |
+| `retrieval_bm25_HR`           | `{domain, sub_question, original_question}` | top-N BM25 results                                                                            |
+| `fusion_rrf`                  | `{domains, total_chunks}`                   | deduplicated ranked list                                                                      |
+| `llm_generation` / `llm_call` | full prompt with merged context             | answer text                                                                                   |
 
 ---
 
@@ -474,23 +494,31 @@ Both run in parallel on virtual threads after the response is returned.
 
 ## Key Design Decisions
 
-1. **Parallel startup**: `domain_routing` + `embedding_generation` + `history_load` + `hasHistory_check` all launch on virtual threads simultaneously. The embedding is needed for cache AND retrieval, so it's computed once and reused everywhere.
+1. **Multi-domain routing with question splitting**: Instead of routing to a single domain, the fast LLM (`llama-3.1-8b-instant`) returns one line per domain in the format `DOMAIN,sub-question`. The question "What is AI product pricing and what leave do employees get?" becomes `HR,What leave do employees get?` + `PRODUCT,What is the AI product pricing?`. Each domain then retrieves using its own focused sub-question.
 
-2. **Ambiguity detection**: Uses `llama-3.1-8b-instant` (fast, ~200ms) instead of the main 70b model. Two-phase: heuristic rules (word count, pronouns, follow-up phrases) → LLM confirmation. If the heuristic flags a query, the semantic cache is skipped even if the LLM says "not ambiguous" (edge-case safety).
+2. **Per-domain sub-question embedding**: Each domain re-embeds its own sub-question locally (ONNX ~5ms) rather than reusing the original question embedding. This means the HR vector search uses an HR-focused vector and the PRODUCT search uses a PRODUCT-focused vector, improving retrieval precision significantly.
 
-3. **Split retrieval**: Instead of a monolithic "retrieval" step, each sub-step (`retrieval_vector`, `retrieval_bm25`, `fusion_rrf`, `reranking`) is individually traced in LangSmith for fine-grained latency observability.
+3. **Parallel domain retrieval**: All detected domains retrieve concurrently via `CompletableFuture`. For a 3-domain question, all 6 retrieval spans (`retrieval_vector_HR`, `retrieval_bm25_HR`, `retrieval_vector_PRODUCT`, etc.) run in parallel on virtual threads, so latency is dominated by the slowest domain, not the sum.
 
-4. **LLM streaming**: `POST /api/v1/chat/stream` returns an SSE event stream. Tokens arrive in real-time via `StreamingChatLanguageModel`. After streaming completes, grounding check + persistence run, and a final `done` event carries the full `ChatResponse` with metadata.
+4. **Cross-domain RRF merge**: After per-domain RRF, all chunks are deduplicated by content hash and re-ranked together in a single `fusion_rrf` step. The final top-5 chunks passed to the LLM can come from any combination of domains.
 
-5. **Semantic cache KNN=3**: Requests 3 nearest neighbors from the HNSW index (instead of 1) for better recall on approximate searches. The best match above the 0.92 similarity threshold is returned.
+5. **Parallel startup**: `domain_routing` + `embedding_generation` + `history_load` + `hasHistory_check` all launch on virtual threads simultaneously. The original question embedding is used for cache lookup; sub-question embeddings are computed later during retrieval.
 
-6. **Fail-open security**: All guards are fail-open — if the Python sidecar is down, queries proceed normally. This is a deliberate trade-off: availability over perfect security. The assumption is that the LLM itself + prompt engineering provides a baseline defense even without the guard sidecar.
+6. **Ambiguity detection**: Uses `llama-3.1-8b-instant` (fast, ~200ms). Two-phase: heuristic rules (word count, pronouns, follow-up phrases) → LLM confirmation. If the heuristic flags a query, the semantic cache is skipped even if the LLM says "not ambiguous" (edge-case safety).
 
-7. **Async quality scoring**: Both grounding and RAGAS run AFTER the response is returned (non-blocking). They write to the database and traces for observability but never add latency to the user experience.
+7. **Split retrieval tracing**: Every retrieval sub-step has its own LangSmith span. For multi-domain queries you see `retrieval_vector_HR`, `retrieval_bm25_HR`, `retrieval_vector_PRODUCT`, etc. — each carrying `domain`, `sub_question`, and `original_question` in `input.value`.
 
-8. **LangSmith tracing**: Every span carries `input.value`, `output.value`, and `langsmith.span.kind`. LLM spans additionally carry `gen_ai.system`, `gen_ai.request.model`, `gen_ai.prompt.0.content`, `gen_ai.completion.0.content`, and token usage. The root span carries all pipeline metrics + RAGAS scores + prompt versions.
+8. **LLM streaming**: `POST /api/v1/chat/stream` returns an SSE event stream. Tokens arrive in real-time via `StreamingChatLanguageModel`. After streaming completes, grounding check + persistence run, and a final `done` event carries the full `ChatResponse` with metadata.
 
-9. **DB-backed prompt management**: Prompts are stored in PostgreSQL with versioning and an active flag. On startup, if the `prompt_templates` table is empty, prompts are seeded from classpath `.st` files as version 1 (active). At runtime, new versions are created via the REST API and activated with a single PUT call. The in-memory cache ensures zero-latency prompt loading even if the DB is slow.
+9. **Semantic cache KNN=3**: Requests 3 nearest neighbors from the HNSW index (instead of 1) for better recall on approximate searches. The best match above the 0.92 similarity threshold is returned.
+
+10. **Fail-open security**: All guards are fail-open — if the Python sidecar is down, queries proceed normally. This is a deliberate trade-off: availability over perfect security.
+
+11. **Async quality scoring**: Both grounding and RAGAS run AFTER the response is returned (non-blocking). They write to the database and traces for observability but never add latency to the user experience.
+
+12. **LangSmith tracing**: Every span carries `input.value`, `output.value`, and `langsmith.span.kind`. LLM spans additionally carry `gen_ai.system`, `gen_ai.request.model`, `gen_ai.prompt.0.content`, `gen_ai.completion.0.content`, and token usage. The root span carries all pipeline metrics + RAGAS scores + prompt versions.
+
+13. **DB-backed prompt management**: Prompts are stored in PostgreSQL with versioning and an active flag. On startup, if the `prompt_templates` table is empty, prompts are seeded from classpath `.st` files as version 1 (active). At runtime, new versions are created via the REST API and activated with a single PUT call.
 
 ## Prompt Management
 
@@ -575,12 +603,28 @@ curl http://localhost:8080/api/v1/prompts/active
 
 ### Chat Response
 
+Single-domain:
+
 ```json
 {
-  "answer": "HR is responsible for recruitment, onboarding, payroll and compliance...",
+  "answer": "Full-time employees are entitled to 24 days of paid annual leave per calendar year...",
   "confidence": "HIGH",
-  "sources": ["HR-Roles-and-Responsibilities-PDF.pdf"],
+  "sources": ["test-hr.txt"],
   "routedDomain": "HR",
+  "domainFallback": false,
+  "status": "COMPLETED",
+  "clarificationOptions": []
+}
+```
+
+Multi-domain (question spanned HR + PRODUCT):
+
+```json
+{
+  "answer": "Employees get 24 days of paid annual leave. AI product pricing is not available in the current documents.",
+  "confidence": "MEDIUM",
+  "sources": ["test-hr.txt"],
+  "routedDomain": "HR,PRODUCT",
   "domainFallback": false,
   "status": "COMPLETED",
   "clarificationOptions": []

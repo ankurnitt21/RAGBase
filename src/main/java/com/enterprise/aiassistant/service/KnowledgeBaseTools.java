@@ -1,24 +1,26 @@
 package com.enterprise.aiassistant.service;
 
-import com.enterprise.aiassistant.dto.Domain;
-import com.enterprise.aiassistant.entity.DocumentChunk;
-import com.enterprise.aiassistant.repository.DocumentChunkRepository;
-import com.enterprise.aiassistant.repository.VectorSearchRepository;
-import com.enterprise.aiassistant.repository.VectorSearchRepository.VectorSearchResult;
-import dev.langchain4j.agent.tool.P;
-import dev.langchain4j.agent.tool.Tool;
-import dev.langchain4j.data.embedding.Embedding;
-import dev.langchain4j.model.embedding.EmbeddingModel;
-import io.github.resilience4j.retry.annotation.Retry;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-import org.springframework.stereotype.Component;
-
 import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.stereotype.Component;
+
+import com.enterprise.aiassistant.dto.Domain;
+import com.enterprise.aiassistant.entity.DocumentChunk;
+import com.enterprise.aiassistant.repository.DocumentChunkRepository;
+import com.enterprise.aiassistant.repository.VectorSearchRepository;
+import com.enterprise.aiassistant.repository.VectorSearchRepository.VectorSearchResult;
+
+import dev.langchain4j.agent.tool.P;
+import dev.langchain4j.agent.tool.Tool;
+import dev.langchain4j.data.embedding.Embedding;
+import dev.langchain4j.model.embedding.EmbeddingModel;
+import io.github.resilience4j.retry.annotation.Retry;
 
 /**
  * LangChain4j @Tool methods exposed to the ChatAssistant AiServices proxy.
@@ -151,12 +153,12 @@ public class KnowledgeBaseTools {
      * Takes top-K from merged results, formats them, and captures in ThreadLocal
      * for grounding check.
      */
-    public String formatAndCapture(List<RankedChunk> merged, String domain, int topK) {
+    public String formatAndCapture(List<RankedChunk> merged, String domainLabel, int topK) {
         if (merged.isEmpty()) {
-            return "No relevant documents found in domain [" + domain + "]";
+            return "No relevant documents found in domain [" + domainLabel + "]";
         }
         List<RankedChunk> reranked = merged.subList(0, Math.min(topK, merged.size()));
-        String result = formatResults(reranked, Domain.valueOf(domain.toUpperCase()));
+        String result = formatResults(reranked, domainLabel);
         RETRIEVED_CONTEXT.get().append(result).append("\n\n---\n\n");
         return result;
     }
@@ -197,7 +199,11 @@ public class KnowledgeBaseTools {
     }
 
     private String formatResults(List<RankedChunk> chunks, Domain domain) {
-        StringBuilder sb = new StringBuilder("Results from domain [" + domain + "]:\n\n");
+        return formatResults(chunks, domain.name());
+    }
+
+    private String formatResults(List<RankedChunk> chunks, String domainLabel) {
+        StringBuilder sb = new StringBuilder("Results from domain [" + domainLabel + "]:\n\n");
         for (int i = 0; i < chunks.size(); i++) {
             sb.append("[%d] source: %s\n%s\n\n".formatted(i + 1, chunks.get(i).source(), chunks.get(i).text()));
         }

@@ -3,6 +3,7 @@ package com.enterprise.aiassistant.service;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
@@ -20,6 +21,7 @@ import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
 import com.enterprise.aiassistant.dto.ChatRequest;
 import com.enterprise.aiassistant.dto.ChatResponse;
+import com.enterprise.aiassistant.dto.Domain;
 import com.enterprise.aiassistant.dto.DomainRoutingResult;
 import com.enterprise.aiassistant.dto.PipelineMetrics;
 import com.enterprise.aiassistant.entity.DocumentChunk;
@@ -155,7 +157,11 @@ public class ChatService {
             // ── Step 1: domain_routing + embedding_generation (PARALLEL) ─────
             CompletableFuture<DomainRoutingResult> routingFuture = CompletableFuture.supplyAsync(
                     () -> tracingService.traceStep("domain_routing", rootSpan,
-                            originalQuestion, () -> domainRouter.route(originalQuestion)),
+                            originalQuestion, () -> {
+                                DomainRoutingResult r = domainRouter.route(originalQuestion);
+                                // Override output.value with domain→sub-question map for LangSmith clarity
+                                return r;
+                            }),
                     pipelineExecutor);
 
             CompletableFuture<Embedding> embeddingFuture = CompletableFuture.supplyAsync(
@@ -174,8 +180,13 @@ public class ChatService {
             DomainRoutingResult routing = routingFuture.join();
             Embedding questionEmbedding = embeddingFuture.join();
 
-            metrics.predictedDomain = routing.domain().name();
-            metrics.finalDomain = routing.domain().name();
+            // Record all detected domains on the root span for LangSmith visibility
+            rootSpan.setAttribute("routing.domains", routing.domainsLabel());
+            rootSpan.setAttribute("routing.primary_domain", routing.domain().name());
+            rootSpan.setAttribute("routing.fallback", routing.fallback());
+
+            metrics.predictedDomain = routing.domainsLabel();
+            metrics.finalDomain = routing.domainsLabel();
 
             // ── Step 2: Ambiguity detection (fast model) ─────────────────────
             boolean heuristicAmbiguous = false;
@@ -186,7 +197,7 @@ public class ChatService {
             if (!hasHistory && vague) {
                 log.info("[{}] Vague question with no history — requesting clarification (fast path)", conversationId);
                 metrics.totalLatencyMs = System.currentTimeMillis() - startTime;
-                tracingService.finalizeRootSpan(rootSpan, metrics, "UNKNOWN", "LOW", true);
+                tracingService.finalizeRootSpan(rootSpan, metrics, routing.domainsLabel(), "LOW", routing.fallback());
                 return new ChatResponse("Your question is a bit vague. Could you add more detail?",
                         "LOW", List.of(), "UNKNOWN", true, "AWAITING_CLARIFICATION", List.of());
             }
@@ -203,14 +214,14 @@ public class ChatService {
                             ? "Could you please expand your question? I need a bit more context to help you."
                             : "Your question is ambiguous. Please choose one of the suggested refinements or rephrase:";
                     metrics.totalLatencyMs = System.currentTimeMillis() - startTime;
-                    tracingService.finalizeRootSpan(rootSpan, metrics, "UNKNOWN", "LOW", true);
+                    tracingService.finalizeRootSpan(rootSpan, metrics, routing.domainsLabel(), "LOW", routing.fallback());
                     return new ChatResponse(message, "LOW", List.of(), "UNKNOWN", true,
                             "AWAITING_CLARIFICATION", ambiguity.options());
                 }
                 log.info("[{}] LLM determined question is unambiguous despite heuristic flag — continuing (cache skipped)", conversationId);
             }
 
-            // ── Step 3: semantic_cache_lookup (skip if heuristic flagged) ────
+            // ── Step 3: semantic_cache_lookup (primary domain only, skip if ambiguous) ──
             if (semanticCacheEnabled && !heuristicAmbiguous) {
                 Optional<ChatResponse> cached = tracingService.traceStepWithLatency(
                         "semantic_cache_lookup", rootSpan, "tool", originalQuestion,
@@ -220,52 +231,101 @@ public class ChatService {
                 if (cached.isPresent()) {
                     metrics.cacheHit = true;
                     metrics.totalLatencyMs = System.currentTimeMillis() - startTime;
-                    log.info("[{}] Semantic cache hit (domain={}) — skipping full pipeline",
-                             conversationId, routing.domain());
-                    logQueryWithMetrics(originalQuestion, routing.domain().name(), cached.get().answer(),
+                    log.info("[{}] Semantic cache hit (domains={}) — skipping full pipeline",
+                             conversationId, routing.domainsLabel());
+                    logQueryWithMetrics(originalQuestion, routing.domainsLabel(), cached.get().answer(),
                             metrics, "HIGH", routing.fallback());
-                    tracingService.finalizeRootSpan(rootSpan, metrics, routing.domain().name(),
+                    tracingService.finalizeRootSpan(rootSpan, metrics, routing.domainsLabel(),
                             cached.get().confidence(), routing.fallback());
                     return cached.get();
                 }
             }
 
-            // ── Step 4: retrieval_vector (uses pre-computed embedding!) ──────
-            List<VectorSearchRepository.VectorSearchResult> vectorResults = tracingService.traceStep(
-                    "retrieval_vector", rootSpan, originalQuestion,
-                    () -> knowledgeBaseTools.vectorSearch(questionEmbedding.vector(), routing.domain().name()));
+            // ── Steps 4+5: Parallel retrieval across ALL detected domains ─────
+            // Each domain gets its own vector + BM25 retrieval running concurrently.
+            // Sub-question is domain-specific; both embedding and BM25 use it.
+            // LangSmith span input shows: domain, sub_question, original_question.
+            Map<Domain, String> domainQuestions = routing.domainQuestions();
 
-            // ── Step 5: retrieval_bm25 ──────────────────────────────────────
-            List<DocumentChunk> bm25Results = tracingService.traceStep(
-                    "retrieval_bm25", rootSpan, originalQuestion,
-                    () -> knowledgeBaseTools.bm25Search(originalQuestion, routing.domain().name()));
+            List<CompletableFuture<List<KnowledgeBaseTools.RankedChunk>>> domainFutures =
+                    domainQuestions.entrySet().stream().map(entry -> {
+                        Domain domain = entry.getKey();
+                        String subQuestion = entry.getValue();
+                        return CompletableFuture.supplyAsync(() -> {
+                            // Embed the domain-specific sub-question (local ONNX, ~5ms)
+                            float[] domainEmbVector = embeddingModel.embed(subQuestion).content().vector();
 
-            // ── Step 6: fusion_rrf ──────────────────────────────────────────
+                            String spanInput = String.format(
+                                    "{\"domain\":\"%s\",\"sub_question\":\"%s\",\"original_question\":\"%s\"}",
+                                    domain.name(),
+                                    subQuestion.length() > 100 ? subQuestion.substring(0, 100) + "…" : subQuestion,
+                                    originalQuestion.length() > 100 ? originalQuestion.substring(0, 100) + "…" : originalQuestion);
+
+                            // ── retrieval_vector_{domain} span ──────────────
+                            List<VectorSearchRepository.VectorSearchResult> vectorResults =
+                                    tracingService.traceStep(
+                                            "retrieval_vector_" + domain.name(), rootSpan,
+                                            spanInput,
+                                            () -> knowledgeBaseTools.vectorSearch(domainEmbVector, domain.name()));
+
+                            // ── retrieval_bm25_{domain} span ────────────────
+                            List<DocumentChunk> bm25Results =
+                                    tracingService.traceStep(
+                                            "retrieval_bm25_" + domain.name(), rootSpan,
+                                            spanInput,
+                                            () -> knowledgeBaseTools.bm25Search(subQuestion, domain.name()));
+
+                            // Per-domain RRF
+                            List<KnowledgeBaseTools.RankedChunk> domainMerged =
+                                    knowledgeBaseTools.rrfMerge(vectorResults, bm25Results);
+
+                            log.info("Domain [{}] sub_question='{}' retrieval: vector={} bm25={} rrf_merged={}",
+                                    domain, subQuestion, vectorResults.size(), bm25Results.size(), domainMerged.size());
+                            return domainMerged;
+                        }, pipelineExecutor);
+                    }).collect(Collectors.toList());
+
+            // Wait for all domain retrievals to finish
+            List<KnowledgeBaseTools.RankedChunk> allChunks = new ArrayList<>();
+            for (CompletableFuture<List<KnowledgeBaseTools.RankedChunk>> f : domainFutures) {
+                allChunks.addAll(f.join());
+            }
+
+            // ── Step 6: fusion_rrf (cross-domain merge) ─────────────────────
+            // Re-rank by RRF score across all domain chunks combined
             List<KnowledgeBaseTools.RankedChunk> merged = tracingService.traceStep(
                     "fusion_rrf", rootSpan,
-                    String.format("{\"vector_count\":%d,\"bm25_count\":%d}", vectorResults.size(), bm25Results.size()),
-                    () -> knowledgeBaseTools.rrfMerge(vectorResults, bm25Results));
+                    String.format("{\"domains\":\"%s\",\"total_chunks\":%d}", routing.domainsLabel(), allChunks.size()),
+                    () -> {
+                        // Deduplicate by content then sort by original order (already RRF-scored per domain)
+                        java.util.LinkedHashMap<String, KnowledgeBaseTools.RankedChunk> deduped =
+                                new java.util.LinkedHashMap<>();
+                        for (KnowledgeBaseTools.RankedChunk c : allChunks) {
+                            deduped.putIfAbsent(c.text(), c);
+                        }
+                        return new ArrayList<>(deduped.values());
+                    });
 
             // ── Step 7: reranking ───────────────────────────────────────────
             KnowledgeBaseTools.clearRetrievedContext();
             String retrieved = tracingService.traceStepWithLatency("reranking", rootSpan,
-                    "chain", String.format("{\"candidates\":%d}", merged.size()),
+                    "chain", String.format("{\"candidates\":%d,\"domains\":\"%s\"}", merged.size(), routing.domainsLabel()),
                     latency -> metrics.rerankingLatencyMs = latency,
-                    () -> knowledgeBaseTools.formatAndCapture(merged, routing.domain().name(), 5));
+                    () -> knowledgeBaseTools.formatAndCapture(merged, routing.domainsLabel(), 5));
             String retrievedContext = KnowledgeBaseTools.drainRetrievedContext();
 
             if (retrieved.startsWith("No relevant documents found")) {
                 String noInfoAnswer = "I could not find relevant information in the knowledge base for this question.";
                 metrics.totalLatencyMs = System.currentTimeMillis() - startTime;
-                logQueryWithMetrics(originalQuestion, routing.domain().name(), noInfoAnswer,
+                logQueryWithMetrics(originalQuestion, routing.domainsLabel(), noInfoAnswer,
                         metrics, "LOW", routing.fallback());
-                tracingService.finalizeRootSpan(rootSpan, metrics, routing.domain().name(), "LOW", routing.fallback());
-                return new ChatResponse(noInfoAnswer, "LOW", List.of(), routing.domain().name(),
+                tracingService.finalizeRootSpan(rootSpan, metrics, routing.domainsLabel(), "LOW", routing.fallback());
+                return new ChatResponse(noInfoAnswer, "LOW", List.of(), routing.domainsLabel(),
                         routing.fallback(), "COMPLETED", List.of());
             }
 
             String history = historyFuture.join();
-            log.info("Question routed to domain: {} (fallback={})", routing.domain(), routing.fallback());
+            log.info("Question routed to domains: {} (fallback={})", routing.domainsLabel(), routing.fallback());
 
             // ── Guard: Indirect Injection Detection (retrieved context) ──────
             GuardrailsClient.IndirectInjectionResult indirectCheck =
@@ -274,11 +334,11 @@ public class ChatService {
                 log.warn("[{}] GUARDRAIL: Indirect injection in retrieved context — type={}, confidence={}, reason={}",
                         conversationId, indirectCheck.attackType(), indirectCheck.confidence(), indirectCheck.reason());
                 metrics.totalLatencyMs = System.currentTimeMillis() - startTime;
-                tracingService.finalizeRootSpan(rootSpan, metrics, routing.domain().name(), "BLOCKED", routing.fallback());
+                tracingService.finalizeRootSpan(rootSpan, metrics, routing.domainsLabel(), "BLOCKED", routing.fallback());
                 return new ChatResponse(
                         "I detected potentially manipulated content in the knowledge base results. "
                         + "For your safety, I cannot provide an answer based on this context. Please try rephrasing your question.",
-                        "BLOCKED", List.of(), routing.domain().name(), routing.fallback(), "BLOCKED", List.of());
+                        "BLOCKED", List.of(), routing.domainsLabel(), routing.fallback(), "BLOCKED", List.of());
             }
 
             // ── Step 8: llm_generation (with child llm_call) ────────────────
@@ -301,11 +361,11 @@ public class ChatService {
                 log.warn("[{}] GUARDRAIL: Data exfiltration blocked — pii={}, secrets={}, issues={}",
                         conversationId, exfilCheck.containsPii(), exfilCheck.containsSecrets(), exfilCheck.issues());
                 metrics.totalLatencyMs = System.currentTimeMillis() - startTime;
-                tracingService.finalizeRootSpan(rootSpan, metrics, routing.domain().name(), "BLOCKED", routing.fallback());
+                tracingService.finalizeRootSpan(rootSpan, metrics, routing.domainsLabel(), "BLOCKED", routing.fallback());
                 return new ChatResponse(
                         "I generated a response but it was blocked by our security system because it "
                         + "contained sensitive information that should not be disclosed. Please refine your question.",
-                        "BLOCKED", List.of(), routing.domain().name(), routing.fallback(), "BLOCKED", List.of());
+                        "BLOCKED", List.of(), routing.domainsLabel(), routing.fallback(), "BLOCKED", List.of());
             }
 
             // ── Step 9+10: response_build (grounding runs async — label only, no decision) ──
@@ -316,7 +376,7 @@ public class ChatService {
                         memoryService.saveMessage(conversationId, "user", originalQuestion);
                         memoryService.saveMessage(conversationId, "assistant", answer);
                         ChatResponse resp = new ChatResponse(answer, "MEDIUM", sources,
-                                routing.domain().name(), routing.fallback(), "COMPLETED", List.of());
+                                routing.domainsLabel(), routing.fallback(), "COMPLETED", List.of());
                         if (semanticCacheEnabled && questionEmbedding != null) {
                             // ── Guard: Cache Poisoning Prevention ─────────────
                             GuardrailsClient.CachePoisonResult cacheCheck =
@@ -334,9 +394,9 @@ public class ChatService {
 
             metrics.totalLatencyMs = System.currentTimeMillis() - startTime;
 
-            QueryLog savedLog = logQueryWithMetrics(originalQuestion, routing.domain().name(), answer,
+            QueryLog savedLog = logQueryWithMetrics(originalQuestion, routing.domainsLabel(), answer,
                     metrics, "MEDIUM", routing.fallback());
-            tracingService.finalizeRootSpan(rootSpan, metrics, routing.domain().name(),
+            tracingService.finalizeRootSpan(rootSpan, metrics, routing.domainsLabel(),
                     "MEDIUM", routing.fallback());
 
             // ── Step 11: grounding_check (async — label only, updates DB after) ──
@@ -344,7 +404,7 @@ public class ChatService {
             final String evalAnswer = answer;
             final String evalContext = retrievedContext;
             final Long savedLogId = savedLog != null ? savedLog.getId() : null;
-            final String domainName = routing.domain().name();
+            final String domainName = routing.domainsLabel();
             final boolean fallbackFlag = routing.fallback();
 
             CompletableFuture.runAsync(() -> {
@@ -457,10 +517,10 @@ public class ChatService {
 
                 DomainRoutingResult routing = routingFuture.join();
                 Embedding questionEmbedding = embeddingFuture.join();
-                metrics.predictedDomain = routing.domain().name();
-                metrics.finalDomain = routing.domain().name();
+                metrics.predictedDomain = routing.domainsLabel();
+                metrics.finalDomain = routing.domainsLabel();
 
-                // Cache lookup
+                // Cache lookup (primary domain only)
                 if (semanticCacheEnabled) {
                     Optional<ChatResponse> cached = semanticCache.lookup(questionEmbedding, routing.domain().name());
                     if (cached.isPresent()) {
@@ -472,21 +532,29 @@ public class ChatService {
                     }
                 }
 
-                // Retrieval
-                List<VectorSearchRepository.VectorSearchResult> vectorResults =
-                        knowledgeBaseTools.vectorSearch(questionEmbedding.vector(), routing.domain().name());
-                List<DocumentChunk> bm25Results =
-                        knowledgeBaseTools.bm25Search(originalQuestion, routing.domain().name());
-                List<KnowledgeBaseTools.RankedChunk> merged =
-                        knowledgeBaseTools.rrfMerge(vectorResults, bm25Results);
-                String retrieved = knowledgeBaseTools.formatAndCapture(merged, routing.domain().name(), 5);
+                // Parallel retrieval across all detected domains (per-domain sub-questions)
+                List<KnowledgeBaseTools.RankedChunk> allStreamChunks = new java.util.ArrayList<>();
+                for (Map.Entry<Domain, String> entry : routing.domainQuestions().entrySet()) {
+                    Domain d = entry.getKey();
+                    String subQ = entry.getValue();
+                    float[] domainEmb = embeddingModel.embed(subQ).content().vector();
+                    allStreamChunks.addAll(knowledgeBaseTools.rrfMerge(
+                            knowledgeBaseTools.vectorSearch(domainEmb, d.name()),
+                            knowledgeBaseTools.bm25Search(subQ, d.name())));
+                }
+                // Deduplicate cross-domain
+                java.util.LinkedHashMap<String, KnowledgeBaseTools.RankedChunk> deduped = new java.util.LinkedHashMap<>();
+                for (KnowledgeBaseTools.RankedChunk c : allStreamChunks) deduped.putIfAbsent(c.text(), c);
+                List<KnowledgeBaseTools.RankedChunk> merged = new java.util.ArrayList<>(deduped.values());
+
+                String retrieved = knowledgeBaseTools.formatAndCapture(merged, routing.domainsLabel(), 5);
                 String retrievedContext = KnowledgeBaseTools.drainRetrievedContext();
 
                 if (retrieved.startsWith("No relevant documents found")) {
                     String msg = "I could not find relevant information in the knowledge base for this question.";
                     emitter.send(SseEmitter.event().data(msg));
                     emitter.send(SseEmitter.event().name("done").data(
-                            new ChatResponse(msg, "LOW", List.of(), routing.domain().name(),
+                            new ChatResponse(msg, "LOW", List.of(), routing.domainsLabel(),
                                     routing.fallback(), "COMPLETED", List.of())));
                     emitter.complete();
                     return;
@@ -497,7 +565,7 @@ public class ChatService {
                 String promptStr = prompt.toString();
                 StringBuilder fullAnswer = new StringBuilder();
 
-                final String domainName = routing.domain().name();
+                final String domainName = routing.domainsLabel();
                 final boolean fallback = routing.fallback();
                 final String rCtx = retrievedContext;
 

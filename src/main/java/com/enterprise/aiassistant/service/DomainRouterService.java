@@ -1,180 +1,126 @@
 package com.enterprise.aiassistant.service;
 
-import java.util.EnumMap;
-import java.util.List;
+import java.util.LinkedHashMap;
 import java.util.Map;
-import java.util.Set;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.stereotype.Service;
 
 import com.enterprise.aiassistant.dto.Domain;
 import com.enterprise.aiassistant.dto.DomainRoutingResult;
 
-import dev.langchain4j.data.embedding.Embedding;
-import dev.langchain4j.model.embedding.EmbeddingModel;
+import dev.langchain4j.model.chat.ChatLanguageModel;
 import jakarta.annotation.PostConstruct;
 
 /**
- * Two-phase domain classifier — fast and accurate, no LLM call required.
+ * Domain classifier that uses the fast LLM (llama-3.1-8b-instant) to:
+ *   1. Detect all relevant domains (HR / PRODUCT / AI) in the question.
+ *   2. Split the question into domain-specific sub-questions.
  *
- * Phase 1: Keyword match (instant, ~0 ms). If keywords produce a clear winner
- *          (score >= 2 or at least 2× the runner-up), that domain is returned.
+ * LLM output format â€” one line per domain:
+ *   DOMAIN,sub-question text
  *
- * Phase 2: Embedding similarity (local ONNX, ~5-10 ms). The question is embedded
- *          and compared against pre-computed domain prototype embeddings using
- *          cosine similarity. The domain with the highest similarity wins.
+ * Example:
+ *   HR,What leave benefits do employees get?
+ *   PRODUCT,What is the AI product pricing?
  *
- * This gives the accuracy of an LLM-based router with the speed of a keyword
- * classifier. The detected domain is used consistently in Redis, Pinecone, and
- * PostgreSQL queries.
+ * Fallback: if the LLM fails, route to PRODUCT with the original question unchanged.
  */
 @Service
 public class DomainRouterService {
 
     private static final Logger log = LoggerFactory.getLogger(DomainRouterService.class);
 
-    private final EmbeddingModel embeddingModel;
+    private final ChatLanguageModel fastLlm;
 
-    /** Pre-computed prototype embeddings for each domain. */
-    private final Map<Domain, Embedding> domainPrototypes = new EnumMap<>(Domain.class);
+    private static final String ROUTER_PROMPT =
+            """
+            You are a domain classifier and question splitter for an enterprise knowledge base.
+            Three domains exist:
+              HR      â€” employee leave, vacation, payroll, benefits, policies, hiring, onboarding, performance reviews
+              PRODUCT â€” product catalog, pricing, features, inventory, orders, shipping, returns, warranties
+              AI      â€” artificial intelligence, machine learning, LLMs, neural networks, NLP, embeddings, RAG, data science
 
-    /**
-     * Prototype phrases that capture each domain's semantic space.
-     * Concatenated and embedded once at startup.
-     */
-    private static final Map<Domain, String> DOMAIN_PROTOTYPES_TEXT = Map.of(
-        Domain.HR,
-            "employee leave policy vacation PTO salary payroll benefits compensation " +
-            "hiring recruitment onboarding offboarding performance review appraisal " +
-            "termination resignation HR human resources handbook workplace policy " +
-            "pension insurance health dental maternity paternity remote work",
-        Domain.PRODUCT,
-            "product pricing cost feature specification inventory stock availability " +
-            "order shipping delivery return refund warranty purchase catalog item " +
-            "subscription plan discount offer demo trial upgrade version release",
-        Domain.AI,
-            "artificial intelligence machine learning deep learning neural network " +
-            "LLM large language model NLP natural language processing embedding vector " +
-            "RAG retrieval augmented generation fine-tuning training inference " +
-            "transformer GPT BERT model prompt token hallucination grounding " +
-            "reciprocal rank fusion RRF reranking semantic search hybrid search " +
-            "cosine similarity vector database chunking text splitting agent " +
-            "chain of thought reasoning knowledge graph ontology computer vision"
-    );
+            Task:
+              1. Identify ALL relevant domains for the user question.
+              2. For each domain, write the sub-question relevant to ONLY that domain.
+              3. Return EXACTLY one line per domain in this format:
+                   DOMAIN,sub-question text
+                 - DOMAIN must be exactly: HR, PRODUCT, or AI (uppercase, no spaces)
+                 - sub-question is the part of the original question that belongs to that domain
+                 - If the full question belongs to one domain, return that domain with the full question
 
-    private static final Map<Domain, Set<String>> DOMAIN_KEYWORDS = Map.of(
-        Domain.HR, Set.of(
-            "leave", "pto", "vacation", "holiday", "absence", "salary", "payroll",
-            "benefits", "bonus", "compensation", "employee", "staff", "workforce",
-            "onboarding", "offboarding", "hiring", "recruitment", "interview",
-            "handbook", "policy", "workplace", "performance", "review", "appraisal",
-            "termination", "resignation", "hr", "human resources", "pension",
-            "insurance", "health", "dental", "maternity", "paternity", "disciplinary",
-            "grievance", "overtime", "remote work", "work from home"
-        ),
-        Domain.PRODUCT, Set.of(
-            "product", "price", "pricing", "cost", "fee", "charge", "feature",
-            "specification", "spec", "inventory", "stock", "availability", "order",
-            "shipping", "delivery", "return", "refund", "warranty", "guarantee",
-            "purchase", "buy", "catalog", "catalogue", "item", "sku", "model",
-            "version", "release", "upgrade", "subscription", "plan", "tier",
-            "discount", "promo", "offer", "demo", "trial"
-        ),
-        Domain.AI, Set.of(
-            "ai", "artificial intelligence", "machine learning", "ml", "llm",
-            "large language model", "neural", "neural network", "deep learning",
-            "data science", "nlp", "natural language", "embedding", "vector",
-            "rag", "retrieval", "fine-tuning", "fine tuning", "training", "inference",
-            "transformer", "gpt", "bert", "dataset", "algorithm",
-            "classification", "regression", "clustering", "prompt", "token",
-            "hallucination", "grounding", "attention", "encoder", "decoder",
-            "reranking", "rerank", "fusion", "rrf", "semantic search",
-            "chunking", "text splitting", "agent", "chain of thought",
-            "knowledge graph", "ontology", "computer vision", "diffusion"
-        )
-    );
+            Rules:
+              - Output ONLY the lines. No explanation, no blank lines, no extra text.
+              - One comma after the domain name; the rest is the sub-question text.
 
-    public DomainRouterService(EmbeddingModel embeddingModel) {
-        this.embeddingModel = embeddingModel;
+            Examples:
+              Q: "What is the vacation leave policy?"
+              HR,What is the vacation leave policy?
+
+              Q: "What is the AI product pricing and what leave benefits do employees get?"
+              HR,What leave benefits do employees get?
+              PRODUCT,What is the AI product pricing?
+
+              Q: "How does our RAG system work and what does the subscription plan cost?"
+              PRODUCT,What does the subscription plan cost?
+              AI,How does our RAG system work?
+
+              Q: "What is the difference between fine-tuning and RAG, and which plan includes it?"
+              PRODUCT,Which subscription plan includes fine-tuning or RAG?
+              AI,What is the difference between fine-tuning and RAG?
+
+            User question: %s
+            """;
+
+    public DomainRouterService(@Qualifier("fastChatModel") ChatLanguageModel fastLlm) {
+        this.fastLlm = fastLlm;
     }
 
     @PostConstruct
-    void initPrototypes() {
-        for (Domain domain : Domain.values()) {
-            String text = DOMAIN_PROTOTYPES_TEXT.get(domain);
-            Embedding emb = embeddingModel.embed(text).content();
-            domainPrototypes.put(domain, emb);
-            log.info("Domain prototype embedding computed for [{}]", domain);
-        }
+    void init() {
+        log.info("DomainRouterService ready â€” fast LLM splits question per domain");
     }
 
     public DomainRoutingResult route(String question) {
-        String lower = question.toLowerCase();
+        try {
+            String raw = fastLlm.generate(ROUTER_PROMPT.formatted(question)).strip();
 
-        // ── Phase 1: Keyword match (instant) ─────────────────────────────────
-        int hrScore      = countMatches(lower, DOMAIN_KEYWORDS.get(Domain.HR));
-        int productScore = countMatches(lower, DOMAIN_KEYWORDS.get(Domain.PRODUCT));
-        int aiScore      = countMatches(lower, DOMAIN_KEYWORDS.get(Domain.AI));
-
-        int maxKeyword = Math.max(hrScore, Math.max(productScore, aiScore));
-        int secondMax = List.of(hrScore, productScore, aiScore).stream()
-                .sorted((a, b) -> b - a).skip(1).findFirst().orElse(0);
-
-        // Strong keyword signal: clear winner with exclusive match or strong lead
-        if (maxKeyword >= 1 && (secondMax == 0 || maxKeyword >= 2 * secondMax)) {
-            Domain domain;
-            if (hrScore == maxKeyword) domain = Domain.HR;
-            else if (productScore == maxKeyword) domain = Domain.PRODUCT;
-            else domain = Domain.AI;
-            log.info("Domain routed via keywords: {} (hr={} product={} ai={})", domain, hrScore, productScore, aiScore);
-            return new DomainRoutingResult(domain, false);
-        }
-
-        // ── Phase 2: Embedding similarity (local ONNX, ~5-10 ms) ────────────
-        Embedding questionEmb = embeddingModel.embed(question).content();
-
-        Domain bestDomain = Domain.PRODUCT;
-        double bestSim = -1.0;
-
-        for (Domain domain : Domain.values()) {
-            double sim = cosineSimilarity(questionEmb.vector(), domainPrototypes.get(domain).vector());
-            log.debug("Domain similarity — {} = {}", domain, String.format("%.4f", sim));
-            if (sim > bestSim) {
-                bestSim = sim;
-                bestDomain = domain;
+            Map<Domain, String> domainQuestions = new LinkedHashMap<>();
+            for (String line : raw.split("\\r?\\n")) {
+                line = line.strip();
+                if (line.isBlank()) continue;
+                int commaIdx = line.indexOf(',');
+                if (commaIdx <= 0) continue;
+                String domainToken = line.substring(0, commaIdx).strip().toUpperCase();
+                String subQuestion = line.substring(commaIdx + 1).strip();
+                if (subQuestion.isBlank()) subQuestion = question;
+                try {
+                    domainQuestions.put(Domain.valueOf(domainToken), subQuestion);
+                } catch (IllegalArgumentException ignored) {
+                    // skip unrecognized token
+                }
             }
+
+            if (!domainQuestions.isEmpty()) {
+                Domain primary = domainQuestions.keySet().iterator().next();
+                log.info("Domain routing â€” domains={} splits=[{}]",
+                        domainQuestions.keySet(),
+                        raw.replace("\n", " | "));
+                return new DomainRoutingResult(primary, domainQuestions, false);
+            }
+
+            log.warn("Fast LLM returned unrecognized output: '{}' â€” fallback to PRODUCT", raw);
+
+        } catch (Exception e) {
+            log.warn("Fast LLM domain routing failed: {} â€” fallback to PRODUCT", e.getMessage());
         }
 
-        // If best similarity is too low, treat as fallback
-        boolean fallback = bestSim < 0.3;
-        if (fallback) {
-            bestDomain = Domain.PRODUCT;
-            log.info("Domain routing fallback to PRODUCT (best similarity {} < 0.3)", String.format("%.4f", bestSim));
-        } else {
-            log.info("Domain routed via embedding: {} (similarity={})", bestDomain, String.format("%.4f", bestSim));
-        }
-
-        return new DomainRoutingResult(bestDomain, fallback);
-    }
-
-    private static int countMatches(String lower, Set<String> keywords) {
-        int count = 0;
-        for (String keyword : keywords) {
-            if (lower.contains(keyword)) count++;
-        }
-        return count;
-    }
-
-    private static double cosineSimilarity(float[] a, float[] b) {
-        double dot = 0, normA = 0, normB = 0;
-        for (int i = 0; i < a.length; i++) {
-            dot += a[i] * b[i];
-            normA += a[i] * a[i];
-            normB += b[i] * b[i];
-        }
-        double denom = Math.sqrt(normA) * Math.sqrt(normB);
-        return denom == 0 ? 0 : dot / denom;
+        // Fallback: single domain PRODUCT with full question
+        Map<Domain, String> fallback = new LinkedHashMap<>();
+        fallback.put(Domain.PRODUCT, question);
+        return new DomainRoutingResult(Domain.PRODUCT, fallback, true);
     }
 }
